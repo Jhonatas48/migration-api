@@ -9,7 +9,7 @@
   <!-- Coordenadas da sua lib -->
   <groupId>com.github.jhonatas48</groupId>
   <artifactId>migration-api</artifactId>
-  <version>1.0.0</version>
+  <version>1.0.1</version>
   <packaging>jar</packaging>
   <name>migration-api</name>
   <description>API de migração plugável (Liquibase + Hibernate) para projetos Spring</description>
