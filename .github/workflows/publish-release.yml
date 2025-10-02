@@ -1,0 +1,63 @@
+name: CI & Publish to GitHub Packages
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: write   # precisa write para criar release
+  packages: write   # precisa para publicar no GitHub Packages
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+          server-id: github
+          server-username: GITHUB_ACTOR
+          server-password: GITHUB_TOKEN
+
+      # Build em PRs e pushes (sem publicar ainda)
+      - name: Build (verify)
+        run: mvn -B -U -DskipTests verify
+
+      # Publica no GitHub Packages apenas em push na main
+      - name: Publish to GitHub Packages
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mvn -B -U -DskipTests deploy \
+            -DaltDeploymentRepository=github::default::https://maven.pkg.github.com/${{ github.repository }}
+
+      # Descobre versão do pom para nomear a release (só em push na main)
+      - name: Extract version from pom.xml
+        id: meta
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          VERSION=$(mvn -q -Dexec.executable=echo -Dexec.args='${project.version}' --non-recursive org.codehaus.mojo:exec-maven-plugin:3.5.0:exec)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      # Cria release e anexa os JARs gerados (só em push na main)
+      - name: Create GitHub Release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.meta.outputs.version }}
+          name: Release ${{ steps.meta.outputs.version }}
+          body: ${{ github.event.head_commit.message }}
+          files: |
+            target/*.jar
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
