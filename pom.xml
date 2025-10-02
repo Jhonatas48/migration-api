@@ -1,0 +1,138 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+                             https://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+  <modelVersion>4.0.0</modelVersion>
+
+  <!-- Coordenadas da sua lib -->
+  <groupId>com.github.jhonatas48</groupId>
+  <artifactId>migration-api</artifactId>
+  <version>1.0.0</version>
+  <packaging>jar</packaging>
+  <name>migration-api</name>
+  <description>API de migração plugável (Liquibase + Hibernate) para projetos Spring</description>
+  <url>https://github.com/jhonatas48</url>
+
+  <properties>
+    <!-- Versões centralizadas -->
+    <java.version>21</java.version>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+    <spring.boot.version>3.3.4</spring.boot.version>
+    <liquibase.version>5.0.0</liquibase.version>
+    <liquibase.hibernate6.version>5.0.0</liquibase.hibernate6.version>
+  </properties>
+
+  <licenses>
+    <license>
+      <name>The Apache License, Version 2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+      <distribution>repo</distribution>
+    </license>
+  </licenses>
+
+  <developers>
+    <developer>
+      <name>Jhonatas</name>
+      <organizationUrl>https://github.com/jhonatas48</organizationUrl>
+    </developer>
+  </developers>
+
+  <dependencies>
+    <!-- A lib não deve empacotar o Spring do projeto host -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter</artifactId>
+      <version>${spring.boot.version}</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-data-jpa</artifactId>
+      <version>${spring.boot.version}</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <!-- Liquibase runtime -->
+    <dependency>
+      <groupId>org.liquibase</groupId>
+      <artifactId>liquibase-core</artifactId>
+      <version>${liquibase.version}</version>
+    </dependency>
+
+    <!-- Extensão do Liquibase para ler entidades JPA (Hibernate 6) -->
+    <dependency>
+      <groupId>org.liquibase.ext</groupId>
+      <artifactId>liquibase-hibernate6</artifactId>
+      <version>${liquibase.hibernate6.version}</version>
+    </dependency>
+
+    <!-- (Opcional) Processor para gerar metadata de @ConfigurationProperties, útil se você tiver props -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-configuration-processor</artifactId>
+      <version>${spring.boot.version}</version>
+      <optional>true</optional>
+      <scope>provided</scope>
+    </dependency>
+
+    <!-- (Opcional) API de anotação, caso sua lib use javax/jakarta annotations -->
+    <dependency>
+      <groupId>jakarta.annotation</groupId>
+      <artifactId>jakarta.annotation-api</artifactId>
+      <version>2.1.1</version>
+      <scope>provided</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <!-- Compilação (Java 21; se você estiver 100% em Java 22, troque para 22) -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+        <configuration>
+          <release>${java.version}</release>
+          <encoding>${project.build.sourceEncoding}</encoding>
+        </configuration>
+      </plugin>
+
+      <!-- Gera fontes e javadoc (útil para consumo em outros projetos) -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-source-plugin</artifactId>
+        <version>3.3.1</version>
+        <executions>
+          <execution>
+            <id>attach-sources</id>
+            <goals><goal>jar</goal></goals>
+          </execution>
+        </executions>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-javadoc-plugin</artifactId>
+        <version>3.7.0</version>
+        <executions>
+          <execution>
+            <id>attach-javadocs</id>
+            <goals><goal>jar</goal></goals>
+            <configuration>
+              <source>${java.version}</source>
+              <encoding>${project.build.sourceEncoding}</encoding>
+              <failOnError>false</failOnError>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <!-- NÃO usar spring-boot-maven-plugin aqui: é uma lib, não um app -->
+    </plugins>
+  </build>
+
+</project>
