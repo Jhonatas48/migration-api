@@ -1,13 +1,18 @@
 package com.github.jhonatas48.migrationapi;
 
 import org.springframework.boot.autoconfigure.AutoConfiguration;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 
+/**
+ * Auto-configuração da Migration API.
+ *
+ * - Habilita o binding de MigrationProperties (application.yml / properties)
+ * - Expõe MigrationService como bean
+ * - Registra o AutoMigrationRunner (opcional, governado por migrationapi.enabled)
+ */
 @AutoConfiguration
 @EnableConfigurationProperties(MigrationProperties.class)
-@ConditionalOnClass(name = "liquibase.command.CommandScope")
 public class MigrationAutoConfiguration {
 
     @Bean
@@ -16,7 +21,8 @@ public class MigrationAutoConfiguration {
     }
 
     @Bean
-    public AutoMigrationRunner autoMigrationRunner(MigrationService migrationService, MigrationProperties properties) {
-        return new AutoMigrationRunner(migrationService, properties);
+    public AutoMigrationRunner autoMigrationRunner(MigrationProperties properties,
+                                                   MigrationService migrationService) {
+        return new AutoMigrationRunner(properties, migrationService);
     }
 }

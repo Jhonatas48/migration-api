@@ -1,0 +1,58 @@
+### Java ###
+*.class
+*.jar
+*.war
+*.ear
+*.iml
+*.log
+*.hprof
+
+# Diretórios de build
+target/
+build/
+out/
+bin/
+
+# Arquivos gerados por pacotes de dependência
+*.ear
+*.war
+*.zip
+*.tar.gz
+*.rar
+
+# Arquivos temporários
+*.swp
+*~
+*.tmp
+*.bak
+*.orig
+.DS_Store
+Thumbs.db
+
+### Maven ###
+.mvn/wrapper/maven-wrapper.jar
+.mvn/wrapper/maven-wrapper.properties
+.mvn/wrapper/maven-wrapperDownloader.java
+!/.mvn/wrapper/maven-wrapper.properties
+!.mvn/wrapper/maven-wrapperDownloader.java
+dependency-reduced-pom.xml
+
+### Gradle ###
+.gradle/
+build/
+!gradle-wrapper.jar
+!gradlew
+!gradlew.bat
+
+### IntelliJ IDEA ###
+.idea/
+*.iws
+*.ipr
+*.iml
+out/
+
+### Spring Boot ###
+# Arquivos de configuração locais
+application-*.yml
+application-*.yaml
+application-*.properties
