@@ -86,37 +86,61 @@ public class SqliteForeignKeySanitizer {
         return new SanitizationResult(extraction.getYamlWithoutFkChanges(), true);
     }
 
+    /**
+     * Adapta a operação do YAML (sem 'match') para o ForeignKeySpec (6 parâmetros).
+     * Passamos 'null' para o MATCH.
+     */
     private static ForeignKeySpec toSpec(ForeignKeyOperation op) {
+        String onDelete = emptyToNull(op.getOnDelete());
+        String onUpdate = emptyToNull(op.getOnUpdate());
+        String match    = null; // extractor atual não expõe 'match'
+
         return new ForeignKeySpec(
                 op.getBaseColumnsCsv(),
                 op.getReferencedTable(),
                 op.getReferencedColumnsCsv(),
-                op.getOnDelete(),
-                op.getOnUpdate()
+                onDelete,
+                onUpdate,
+                match
         );
     }
 
+    private static String emptyToNull(String s) {
+        return (s == null || s.isBlank()) ? null : s;
+    }
+
     private String buildNormalizedPlan(Map<String, List<ForeignKeyOperation>> opsByTable) {
-        // Texto canônico para hash: por tabela, ADD/DROP ordenado por colunas
+        // Texto canônico para hash: por tabela, ADD/DROP ordenado por colunas (null-safe)
         StringBuilder sb = new StringBuilder();
         List<String> tables = new ArrayList<>(opsByTable.keySet());
-        Collections.sort(tables, String.CASE_INSENSITIVE_ORDER);
+        tables.sort(String.CASE_INSENSITIVE_ORDER);
+
         for (String t : tables) {
             sb.append("TABLE=").append(t).append("\n");
             List<ForeignKeyOperation> ops = new ArrayList<>(opsByTable.get(t));
-            ops.sort(Comparator.comparing(ForeignKeyOperation::getKind)
-                    .thenComparing(o -> o.getBaseColumnsCsv().toLowerCase(Locale.ROOT)));
+            ops.sort(Comparator
+                    .comparing(ForeignKeyOperation::getKind)
+                    .thenComparing(o -> safeLower(o.getBaseColumnsCsv())));
+
             for (ForeignKeyOperation op : ops) {
+                String onDel = emptyToNull(op.getOnDelete());
+                String onUpd = emptyToNull(op.getOnUpdate());
+
                 sb.append(op.getKind()).append(" ")
                         .append(op.getBaseColumnsCsv()).append(" -> ")
                         .append(op.getReferencedTable()).append("(")
                         .append(op.getReferencedColumnsCsv()).append(")")
-                        .append(op.getOnDelete().isBlank() ? "" : " DEL=" + op.getOnDelete())
-                        .append(op.getOnUpdate().isBlank() ? "" : " UPD=" + op.getOnUpdate())
+                        .append(onDel == null ? "" : " DEL=" + onDel)
+                        .append(onUpd == null ? "" : " UPD=" + onUpd)
+                        // sem MATCH, pois o extractor atual não fornece
                         .append("\n");
             }
         }
         return sb.toString();
+    }
+
+    private static String safeLower(String s) {
+        return s == null ? "" : s.toLowerCase(Locale.ROOT);
     }
 
     public static final class SanitizationResult {
