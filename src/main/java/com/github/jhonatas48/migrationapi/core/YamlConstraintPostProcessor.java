@@ -1,4 +1,3 @@
-
 package com.github.jhonatas48.migrationapi.core;
 
 import com.github.jhonatas48.migrationapi.MigrationProperties;
@@ -96,7 +95,7 @@ public class YamlConstraintPostProcessor {
             if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') b.append(c);
             else b.append('_');
         }
-        String n = b.toString().replaceAll("_+", "_"); 
+        String n = b.toString().replaceAll("_+", "_");
         if (n.startsWith("_")) n = n.substring(1);
         return n.isEmpty() ? "v" : n;
     }
