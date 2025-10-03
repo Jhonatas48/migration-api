@@ -10,6 +10,7 @@ import com.github.jhonatas48.migrationapi.core.YamlConstraintPostProcessor;
 import com.github.jhonatas48.migrationapi.support.HibernateReferenceUrlBuilder;
 import com.github.jhonatas48.migrationapi.support.ResourceAccessorFactory;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
+import org.springframework.boot.autoconfigure.jdbc.DataSourceProperties;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 
@@ -31,12 +32,9 @@ public class MigrationAutoConfiguration {
     }
 
     @Bean
-    public ChangeLogGenerator changeLogGenerator(MigrationProperties properties,
-                                                 HibernateReferenceUrlBuilder referenceUrlBuilder,
-                                                 YamlConstraintPostProcessor yamlConstraintPostProcessor,
-                                                 SqliteChangeSetRewriter sqliteChangeSetRewriter) {
-        EnumConstraintStrategy enumStrategy = new NoopEnumConstraintStrategy();
-        return new ChangeLogGenerator(properties, referenceUrlBuilder, yamlConstraintPostProcessor, sqliteChangeSetRewriter, enumStrategy);
+    public ChangeLogGenerator changeLogGenerator(MigrationProperties migrationProperties,
+                                                 DataSourceProperties dataSourceProperties) {
+        return new ChangeLogGenerator(migrationProperties, dataSourceProperties);
     }
 
     @Bean
