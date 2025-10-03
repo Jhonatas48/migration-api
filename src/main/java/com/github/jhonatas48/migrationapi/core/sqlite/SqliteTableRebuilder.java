@@ -13,13 +13,7 @@ import java.util.stream.Collectors;
  * - Lê o schema atual (PRAGMA table_info, PRAGMA foreign_key_list)
  * - Remove e adiciona FKs conforme solicitado
  * - Cria tabela temporária com o novo CREATE TABLE (incluindo FKs)
- * - Copia dados, remove a tabela original e renomeia a temporária
- * - Recria índices (incluindo UNIQUE)
- *
- * Boas práticas aplicadas:
- * - Nomes descritivos e sem abreviações confusas
- * - Extração de métodos para responsabilidades únicas (SRP/SoC)
- * - Falhas com mensagens claras e diagnóstico completo
+ * - Copia dados, faz swap via rename (backup) e recria índices
  * - Garantias transacionais (commit/rollback) e restabelecimento de estado (foreign_keys/autoCommit)
  */
 public class SqliteTableRebuilder {
@@ -34,8 +28,10 @@ public class SqliteTableRebuilder {
     private static final String PRAGMA_INDEX_INFO       = "PRAGMA index_info(%s)";
     private static final String PRAGMA_FK_LIST          = "PRAGMA foreign_key_list(%s)";
     private static final String PRAGMA_FK_CHECK         = "PRAGMA foreign_key_check";
+    private static final String PRAGMA_LEGACY_ALTER     = "PRAGMA legacy_alter_table=ON";
 
     private static final String TEMP_TABLE_PREFIX       = "__tmp_";
+    private static final String BACKUP_TABLE_PREFIX     = "__bak_";
 
     public static final class ForeignKeySpec {
         private final String baseColumnsCsv;
@@ -97,6 +93,8 @@ public class SqliteTableRebuilder {
 
             try {
                 disableForeignKeyEnforcement(connection);
+                // Ajuda ALTER/RENAME a serem mais permissivos em cenários antigos de SQLite
+                safelyExecute(connection, PRAGMA_LEGACY_ALTER);
 
                 TableSchema currentSchema = readCurrentTableSchema(connection, tableName);
                 if (currentSchema.columns.isEmpty()) {
@@ -110,16 +108,28 @@ public class SqliteTableRebuilder {
                 );
 
                 String tempTableName = TEMP_TABLE_PREFIX + tableName;
-                String createTempSql = buildCreateTableStatement(tableName, currentSchema, finalForeignKeys, tempTableName);
+                String backupTableName = BACKUP_TABLE_PREFIX + tableName;
 
+                String createTempSql = buildCreateTableStatement(tableName, currentSchema, finalForeignKeys, tempTableName);
                 List<IndexDefinition> currentIndexes = readCurrentIndexes(connection, tableName);
 
+                // 1) Cria a tabela temporária com o novo schema
                 createTemporaryTable(connection, createTempSql);
+
+                // 2) Copia dados coluna-a-coluna (mesmo conjunto)
                 copyDataSameColumns(connection, tableName, tempTableName, currentSchema);
-                dropOriginalTable(connection, tableName);
-                renameTemporaryTable(connection, tempTableName, tableName);
+
+                // 3) Swap com backup (evita DROP da original com FKs apontando)
+                renameTable(connection, tableName, backupTableName);   // original -> backup
+                renameTable(connection, tempTableName, tableName);     // temp -> nome final
+
+                // 4) Recria índices na tabela final (nome antigo mantido)
                 recreateIndexes(connection, tableName, currentIndexes);
 
+                // 5) Agora é seguro dropar o backup
+                dropTable(connection, backupTableName);
+
+                // 6) Religa FKs e valida integridade
                 enableForeignKeyEnforcement(connection);
                 validateReferentialIntegrityOrFail(connection, tableName);
 
@@ -161,12 +171,13 @@ public class SqliteTableRebuilder {
         executeStatement(connection, insertSql);
     }
 
-    private void dropOriginalTable(Connection connection, String tableName) throws SQLException {
-        executeStatement(connection, "DROP TABLE " + quoteIdentifier(tableName));
+    // >>> novos helpers de swap seguro
+    private void renameTable(Connection connection, String from, String to) throws SQLException {
+        executeStatement(connection, "ALTER TABLE " + quoteIdentifier(from) + " RENAME TO " + quoteIdentifier(to));
     }
 
-    private void renameTemporaryTable(Connection connection, String tempTableName, String finalName) throws SQLException {
-        executeStatement(connection, "ALTER TABLE " + quoteIdentifier(tempTableName) + " RENAME TO " + quoteIdentifier(finalName));
+    private void dropTable(Connection connection, String tableName) throws SQLException {
+        executeStatement(connection, "DROP TABLE " + quoteIdentifier(tableName));
     }
 
     private void recreateIndexes(Connection connection, String tableName, List<IndexDefinition> previousIndexes) throws SQLException {
