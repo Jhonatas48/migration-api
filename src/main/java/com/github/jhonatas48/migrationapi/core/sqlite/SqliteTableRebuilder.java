@@ -9,22 +9,22 @@ import java.util.*;
 import java.util.stream.Collectors;
 
 /**
- * Reconstrói tabelas no SQLite para aplicar alterações de chaves estrangeiras (FK) e preservar
- * corretamente constraints/atributos de coluna (NOT NULL, DEFAULT, PK e AUTOINCREMENT).
+ * Reconstrói tabelas no SQLite para aplicar alterações de FKs preservando:
+ * - NOT NULL, DEFAULT, PK (single/composta) e AUTOINCREMENT (via sqlite_master)
+ * - ÍNDICES (incl. parciais/expressões/collation) e TRIGGERS (via sqlite_master)
  *
  * Fluxo robusto:
- *  1) PRAGMA foreign_keys = OFF (com restauração garantida)
- *  2) Lê schema atual: PRAGMAs table_info / foreign_key_list / index_list / index_info
- *  3) Lê DDL original (sqlite_master.sql) para detectar AUTOINCREMENT, quando existir
- *  4) Calcula FKs finais (remove solicitadas, adiciona novas)
- *  5) Cria tabela temporária com schema final (inclui FKs)
- *  6) Copia dados coluna-a-coluna
- *  7) Swap atômico via rename: original -> __bak_, temp -> original
- *  8) Recria índices
- *  9) DROP __bak_ (com proteção de PRAGMA), PRAGMA foreign_keys = ON e foreign_key_check
+ *  1) PRAGMA foreign_keys = OFF + legacy_alter_table=ON
+ *  2) Limpeza de resíduos (__tmp_*, __bak_*)
+ *  3) Lê schema corrente (PRAGMAs) e DDL original (sqlite_master.sql)
+ *  4) Calcula FKs finais (inclui MATCH) e NORMALIZA nomes de tabelas referenciadas
+ *  5) Cria tabela temporária com schema final
+ *  6) Copia dados coluna-a-coluna (mesma lista)
+ *  7) SWAP: RENAME original -> __bak_, RENAME temp -> original
+ *  8) DROP __bak_ (seguro)
+ *  9) Recria índices e triggers pela DDL do sqlite_master
+ * 10) PRAGMA foreign_keys = ON + PRAGMA foreign_key_check (diagnóstico)
  *
- *  - Restauração de estado (auto-commit e PRAGMA foreign_keys)
- *  - Mensagens de erro detalhadas com diagnóstico de FKs
  */
 public class SqliteTableRebuilder {
 
@@ -44,26 +44,27 @@ public class SqliteTableRebuilder {
     private static final String TEMP_TABLE_PREFIX           = "__tmp_";
     private static final String BACKUP_TABLE_PREFIX         = "__bak_";
 
-    /**
-     * Especificação de uma FK (colunas base e referenciadas + ações).
-     */
+    /** Especificação de uma FK (colunas base e referenciadas + ações). */
     public static final class ForeignKeySpec {
         private final String baseColumnsCsv;
         private final String referencedTable;
         private final String referencedColumnsCsv;
         private final String onDeleteAction;
         private final String onUpdateAction;
+        private final String matchAction; // opcional (SIMPLE/FULL/PARTIAL/NONE)
 
         public ForeignKeySpec(String baseColumnsCsv,
                               String referencedTable,
                               String referencedColumnsCsv,
                               String onDelete,
-                              String onUpdate) {
+                              String onUpdate,
+                              String matchAction) {
             this.baseColumnsCsv = baseColumnsCsv;
             this.referencedTable = referencedTable;
             this.referencedColumnsCsv = referencedColumnsCsv;
             this.onDeleteAction = onDelete;
             this.onUpdateAction = onUpdate;
+            this.matchAction = matchAction;
         }
 
         public String getBaseColumnsCsv()       { return baseColumnsCsv; }
@@ -71,6 +72,11 @@ public class SqliteTableRebuilder {
         public String getReferencedColumnsCsv() { return referencedColumnsCsv; }
         public String getOnDelete()             { return onDeleteAction; }
         public String getOnUpdate()             { return onUpdateAction; }
+        public String getMatch()                { return matchAction; }
+
+        public ForeignKeySpec withReferencedTable(String newReferencedTable) {
+            return new ForeignKeySpec(baseColumnsCsv, newReferencedTable, referencedColumnsCsv, onDeleteAction, onUpdateAction, matchAction);
+        }
 
         @Override
         public String toString() {
@@ -81,6 +87,9 @@ public class SqliteTableRebuilder {
                     .append("(").append(referencedColumnsCsv).append(")");
             if (onDeleteAction != null && !onDeleteAction.isBlank()) description.append(" ON DELETE ").append(onDeleteAction);
             if (onUpdateAction != null && !onUpdateAction.isBlank()) description.append(" ON UPDATE ").append(onUpdateAction);
+            if (matchAction != null && !matchAction.isBlank() && !"NONE".equalsIgnoreCase(matchAction)) {
+                description.append(" MATCH ").append(matchAction);
+            }
             return description.toString();
         }
     }
@@ -92,12 +101,7 @@ public class SqliteTableRebuilder {
     }
 
     /**
-     * Reconstrói a tabela para aplicar adições e remoções de FKs preservando NOT NULL, DEFAULT,
-     * PK e AUTOINCREMENT quando aplicável.
-     *
-     * @param tableName         Nome da tabela a reconstruir
-     * @param foreignKeysToAdd  FKs a adicionar
-     * @param foreignKeysToDrop FKs a remover
+     * Reconstrói a tabela para aplicar adições/remoções de FKs preservando colunas, índices e triggers.
      */
     public void rebuildTableApplyingForeignKeyChanges(String tableName,
                                                       List<ForeignKeySpec> foreignKeysToAdd,
@@ -111,14 +115,20 @@ public class SqliteTableRebuilder {
                 disableForeignKeyEnforcement(connection);
                 safelyExecute(connection, PRAGMA_LEGACY_ALTER_ON);
 
-                // 2) Metadados atuais
+                // 2) Limpeza de resíduos de execuções falhas
+                dropTableIfExists(connection, TEMP_TABLE_PREFIX + tableName);
+                dropTableIfExists(connection, BACKUP_TABLE_PREFIX + tableName);
+
+                // 3) Metadados atuais
                 TableSchema currentSchema = readCurrentTableSchema(connection, tableName);
                 if (currentSchema.columns.isEmpty()) {
                     throw new IllegalStateException("Tabela não encontrada ou sem colunas: " + tableName);
                 }
 
-                // Lê DDL original para detectar AUTOINCREMENT (não está em PRAGMA table_info)
+                // DDL original (para detectar AUTOINCREMENT) e DDLs de índices/triggers
                 String originalCreateTableSql = readCreateTableSql(connection, tableName);
+                List<RawIndexDef> cachedIndexCreateSql = readIndexCreateSql(connection, tableName);
+                List<RawTriggerDef> cachedTriggerCreateSql = readTriggerCreateSql(connection, tableName);
 
                 // PKs atuais (para filtrar possíveis colunas AUTOINCREMENT)
                 List<String> currentPrimaryKeyColumns = currentSchema.columns.stream()
@@ -137,29 +147,33 @@ public class SqliteTableRebuilder {
                         currentForeignKeys, foreignKeysToAdd, foreignKeysToDrop
                 );
 
-                // 3) Nomes e SQL de criação
+                // >>>>> NOVO: normaliza nomes de tabelas referenciadas para o que existe de fato
+                Set<String> existingTables = readExistingTableNames(connection);
+                desiredForeignKeys = normalizeReferencedTablesOrFail(desiredForeignKeys, existingTables);
+
+                // 4) Nomes e SQL de criação
                 String tempTableName   = TEMP_TABLE_PREFIX + tableName;
                 String backupTableName = BACKUP_TABLE_PREFIX + tableName;
                 String createTempSql   = buildCreateTableStatement(
                         tableName, currentSchema, desiredForeignKeys, tempTableName, autoIncrementColumns
                 );
-                List<IndexDefinition> currentIndexes = readCurrentIndexes(connection, tableName);
 
-                // 4) Cria temp e copia dados
+                // 5) Cria temp e copia dados
                 createTemporaryTable(connection, createTempSql);
                 copyDataSameColumns(connection, tableName, tempTableName, currentSchema);
 
-                // 5) Swap via rename com backup
+                // 6) SWAP via rename com backup
                 renameTableSafely(connection, tableName, backupTableName); // original -> backup
                 renameTableSafely(connection, tempTableName, tableName);   // temp -> original
 
-                // 6) Recria índices na tabela final
-                recreateIndexes(connection, tableName, currentIndexes);
-
-                // 7) Remove backup (com proteção de PRAGMA)
+                // 7) DROP do backup (antes de recriar índices/triggers para evitar colisão de nomes)
                 dropTableSafely(connection, backupTableName);
 
-                // 8) FK ON e validação
+                // 8) Recria índices e triggers preservando DDL original
+                recreateIndexesFromSqlMaster(connection, tableName, cachedIndexCreateSql);
+                recreateTriggersFromSqlMaster(connection, tableName, cachedTriggerCreateSql);
+
+                // 9) FK ON e validação
                 enableForeignKeyEnforcement(connection);
                 validateReferentialIntegrityOrFail(connection, tableName);
 
@@ -167,15 +181,123 @@ public class SqliteTableRebuilder {
                 LOGGER.info("Rebuild da tabela '{}' concluído com sucesso.", tableName);
             } catch (Throwable failure) {
                 safeRollback(connection);
-                // Garante que não deixe a conexão com FK desligado
-                safelyExecute(connection, PRAGMA_FOREIGN_KEYS_ON);
+                safelyExecute(connection, PRAGMA_FOREIGN_KEYS_ON); // garante não deixar FK OFF
                 throw failure;
             } finally {
-                // Restaura auto-commit e força FK ON para não vazar estado
                 safelyExecute(connection, PRAGMA_FOREIGN_KEYS_ON);
                 connection.setAutoCommit(previousAutoCommit);
             }
         }
+    }
+
+    // ===================== Normalização de nomes referenciados =====================
+
+    /**
+     * Lê nomes de todas as tabelas usuais do banco (sqlite_master).
+     */
+    private Set<String> readExistingTableNames(Connection connection) throws SQLException {
+        Set<String> names = new LinkedHashSet<>();
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")) {
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) names.add(rs.getString(1));
+            }
+        }
+        return names;
+    }
+
+    /**
+     * Para cada FK desejada, valida se a tabela referenciada existe. Se não existir:
+     * - tenta resolver por igualdade case-insensitive;
+     * - tenta resolver por forma canônica (remove underscores/pontuação e minúscula);
+     * - tenta resolver pela forma "inserindo underscores" em camelCase (ex.: FormDeveloper -> Form_Developer).
+     * Se ainda assim não encontrar, lança IllegalStateException com dicas.
+     */
+    private List<ForeignKeySpec> normalizeReferencedTablesOrFail(List<ForeignKeySpec> desired,
+                                                                 Set<String> existingTables) {
+        if (desired == null || desired.isEmpty()) return desired;
+
+        // mapas auxiliares para resolução
+        Map<String, String> byLower = new HashMap<>();
+        Map<String, String> byCanonical = new LinkedHashMap<>();
+        for (String t : existingTables) {
+            byLower.put(t.toLowerCase(Locale.ROOT), t);
+            byCanonical.put(canonical(t), t);
+        }
+
+        List<ForeignKeySpec> normalized = new ArrayList<>(desired.size());
+        for (ForeignKeySpec fk : desired) {
+            String ref = fk.getReferencedTable();
+            if (ref == null || ref.isBlank()) { normalized.add(fk); continue; }
+
+            // 1) igual (case-sensitive) já existente
+            if (existingTables.contains(ref)) {
+                normalized.add(fk);
+                continue;
+            }
+
+            // 2) case-insensitive
+            String lowerMatch = byLower.get(ref.toLowerCase(Locale.ROOT));
+            if (lowerMatch != null) {
+                if (!lowerMatch.equals(ref)) {
+                    LOGGER.info("Normalizando tabela referenciada '{}' -> '{}'", ref, lowerMatch);
+                }
+                normalized.add(fk.withReferencedTable(lowerMatch));
+                continue;
+            }
+
+            // 3) canônico (remove _ e pontuação; minúscula)
+            String canonicalRef = canonical(ref);
+            String canonicalMatch = byCanonical.get(canonicalRef);
+            if (canonicalMatch != null) {
+                if (!canonicalMatch.equals(ref)) {
+                    LOGGER.info("Normalizando (canônico) tabela referenciada '{}' -> '{}'", ref, canonicalMatch);
+                }
+                normalized.add(fk.withReferencedTable(canonicalMatch));
+                continue;
+            }
+
+            // 4) heurística camelCase -> snake with underscores (ex.: FormDeveloper -> Form_Developer)
+            String snakeGuess = camelToUnderscore(ref);
+            String snakeMatch = byLower.get(snakeGuess.toLowerCase(Locale.ROOT));
+            if (snakeMatch != null) {
+                LOGGER.info("Normalizando (camel->underscore) '{}' -> '{}'", ref, snakeMatch);
+                normalized.add(fk.withReferencedTable(snakeMatch));
+                continue;
+            }
+
+            // 5) falha — ajuda o usuário listando alternativas
+            String hint = existingTables.stream()
+                    .sorted()
+                    .collect(Collectors.joining(", "));
+            throw new IllegalStateException(
+                    "Tabela referenciada pela FK não existe: '" + ref + "'. " +
+                            "Tabelas existentes: [" + hint + "]. " +
+                            "Dica: ajuste o nome da tabela ou a política de mapeamento (camelCase/underscore)."
+            );
+        }
+        return normalized;
+    }
+
+    /** Forma canônica: remove underscores e não-alfa-numéricos; minúscula. */
+    private static String canonical(String name) {
+        if (name == null) return "";
+        return name.replaceAll("[^A-Za-z0-9]", "").toLowerCase(Locale.ROOT);
+    }
+
+    /** Heurística simples: insere '_' antes de cada letra maiúscula (exceto a primeira). */
+    private static String camelToUnderscore(String name) {
+        if (name == null || name.isBlank()) return name;
+        StringBuilder sb = new StringBuilder();
+        char[] cs = name.toCharArray();
+        for (int i = 0; i < cs.length; i++) {
+            char ch = cs[i];
+            if (i > 0 && Character.isUpperCase(ch) && (Character.isLowerCase(cs[i - 1]) || Character.isDigit(cs[i - 1]))) {
+                sb.append('_');
+            }
+            sb.append(ch);
+        }
+        return sb.toString();
     }
 
     // ===================== Orquestração de Passos =====================
@@ -204,18 +326,21 @@ public class SqliteTableRebuilder {
         executeStatement(connection, insertSql);
     }
 
-    private void recreateIndexes(Connection connection,
-                                 String tableName,
-                                 List<IndexDefinition> previousIndexes) throws SQLException {
-        for (IndexDefinition index : previousIndexes) {
-            if (index.createdFromPrimaryKey) continue; // PK já está no CREATE TABLE
-            String indexColumns = index.columns.stream()
-                    .map(SqliteTableRebuilder::quoteIdentifier)
-                    .collect(Collectors.joining(", "));
-            String uniqueClause = index.unique ? "UNIQUE " : "";
-            String createIndexSql = "CREATE " + uniqueClause + "INDEX " + quoteIdentifier(index.name)
-                    + " ON " + quoteIdentifier(tableName) + " (" + indexColumns + ")";
-            executeStatement(connection, createIndexSql);
+    private void recreateIndexesFromSqlMaster(Connection connection,
+                                              String tableName,
+                                              List<RawIndexDef> indexDefs) throws SQLException {
+        for (RawIndexDef def : indexDefs) {
+            if (def.createSql == null || def.createSql.isBlank()) continue; // índices implícitos (ex.: PK)
+            executeStatement(connection, def.createSql);
+        }
+    }
+
+    private void recreateTriggersFromSqlMaster(Connection connection,
+                                               String tableName,
+                                               List<RawTriggerDef> triggerDefs) throws SQLException {
+        for (RawTriggerDef def : triggerDefs) {
+            if (def.createSql == null || def.createSql.isBlank()) continue;
+            executeStatement(connection, def.createSql);
         }
     }
 
@@ -229,7 +354,7 @@ public class SqliteTableRebuilder {
         throw new IllegalStateException(errorMessage);
     }
 
-    // ===================== Helpers de Swap/Drop Seguros =====================
+    // ===================== Helpers de Swap/Drop/Resíduos =====================
 
     private void renameTableSafely(Connection connection, String fromTable, String toTable) throws SQLException {
         boolean wasOn = isForeignKeysOn(connection);
@@ -250,6 +375,10 @@ public class SqliteTableRebuilder {
         } finally {
             if (wasOn) setForeignKeys(connection, true);
         }
+    }
+
+    private void dropTableIfExists(Connection connection, String tableName) throws SQLException {
+        executeStatement(connection, "DROP TABLE IF EXISTS " + quoteIdentifier(tableName));
     }
 
     private static boolean isForeignKeysOn(Connection connection) {
@@ -339,17 +468,20 @@ public class SqliteTableRebuilder {
         private final String referencedColumn;
         private final String onUpdateAction;
         private final String onDeleteAction;
+        private final String matchAction;
 
         private ForeignKeyRow(String referencedTable,
                               String baseColumn,
                               String referencedColumn,
                               String onUpdateAction,
-                              String onDeleteAction) {
+                              String onDeleteAction,
+                              String matchAction) {
             this.referencedTable = referencedTable;
             this.baseColumn = baseColumn;
             this.referencedColumn = referencedColumn;
             this.onUpdateAction = onUpdateAction;
             this.onDeleteAction = onDeleteAction;
+            this.matchAction = matchAction;
         }
     }
 
@@ -368,6 +500,18 @@ public class SqliteTableRebuilder {
             this.referencedParentTable = referencedParentTable;
             this.foreignKeyId = foreignKeyId;
         }
+    }
+
+    private static final class RawIndexDef {
+        final String name;
+        final String createSql; // null para índices implícitos (ex.: PK)
+        RawIndexDef(String name, String createSql) { this.name = name; this.createSql = createSql; }
+    }
+
+    private static final class RawTriggerDef {
+        final String name;
+        final String createSql; // não-null
+        RawTriggerDef(String name, String createSql) { this.name = name; this.createSql = createSql; }
     }
 
     // ===================== Leitura de Metadados =====================
@@ -399,28 +543,31 @@ public class SqliteTableRebuilder {
              ResultSet result = statement.executeQuery()) {
 
             while (result.next()) {
-                int constraintId      = result.getInt("id");
-                String referencedTable = result.getString("table");
-                String baseColumn      = result.getString("from");
-                String referencedColumn= result.getString("to");
-                String onUpdate        = result.getString("on_update");
-                String onDelete        = result.getString("on_delete");
+                int constraintId       = result.getInt("id");
+                String referencedTable  = result.getString("table");
+                String baseColumn       = result.getString("from");
+                String referencedColumn = result.getString("to");
+                String onUpdate         = result.getString("on_update");
+                String onDelete         = result.getString("on_delete");
+                String matchAction      = result.getString("match");
 
                 groupedByConstraint
                         .computeIfAbsent(constraintId, k -> new ArrayList<>())
-                        .add(new ForeignKeyRow(referencedTable, baseColumn, referencedColumn, onUpdate, onDelete));
+                        .add(new ForeignKeyRow(referencedTable, baseColumn, referencedColumn, onUpdate, onDelete, matchAction));
             }
         }
 
         List<ForeignKeySpec> foreignKeys = new ArrayList<>();
         for (List<ForeignKeyRow> rowsOfConstraint : groupedByConstraint.values()) {
-            String referencedTable       = rowsOfConstraint.get(0).referencedTable;
-            String onUpdate              = rowsOfConstraint.get(0).onUpdateAction;
-            String onDelete              = rowsOfConstraint.get(0).onDeleteAction;
-            String baseColumnsCsv        = rowsOfConstraint.stream().map(r -> r.baseColumn).collect(Collectors.joining(","));
-            String referencedColumnsCsv  = rowsOfConstraint.stream().map(r -> r.referencedColumn).collect(Collectors.joining(","));
+            String referencedTable      = rowsOfConstraint.get(0).referencedTable;
+            String onUpdate             = rowsOfConstraint.get(0).onUpdateAction;
+            String onDelete             = rowsOfConstraint.get(0).onDeleteAction;
+            String matchAction          = rowsOfConstraint.get(0).matchAction;
 
-            foreignKeys.add(new ForeignKeySpec(baseColumnsCsv, referencedTable, referencedColumnsCsv, onDelete, onUpdate));
+            String baseColumnsCsv       = rowsOfConstraint.stream().map(r -> r.baseColumn).collect(Collectors.joining(","));
+            String referencedColumnsCsv = rowsOfConstraint.stream().map(r -> r.referencedColumn).collect(Collectors.joining(","));
+
+            foreignKeys.add(new ForeignKeySpec(baseColumnsCsv, referencedTable, referencedColumnsCsv, onDelete, onUpdate, matchAction));
         }
 
         return foreignKeys;
@@ -453,6 +600,30 @@ public class SqliteTableRebuilder {
         }
 
         return indexDefinitions;
+    }
+
+    private List<RawIndexDef> readIndexCreateSql(Connection connection, String tableName) throws SQLException {
+        List<RawIndexDef> out = new ArrayList<>();
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT name, sql FROM sqlite_master WHERE type='index' AND tbl_name=? AND sql IS NOT NULL")) {
+            ps.setString(1, tableName);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) out.add(new RawIndexDef(rs.getString("name"), rs.getString("sql")));
+            }
+        }
+        return out;
+    }
+
+    private List<RawTriggerDef> readTriggerCreateSql(Connection connection, String tableName) throws SQLException {
+        List<RawTriggerDef> out = new ArrayList<>();
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT name, sql FROM sqlite_master WHERE type='trigger' AND tbl_name=?")) {
+            ps.setString(1, tableName);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) out.add(new RawTriggerDef(rs.getString("name"), rs.getString("sql")));
+            }
+        }
+        return out;
     }
 
     // ===================== Construção do CREATE TABLE =====================
@@ -544,6 +715,10 @@ public class SqliteTableRebuilder {
         }
         if (foreignKey.getOnUpdate() != null && !foreignKey.getOnUpdate().isBlank()) {
             definition.append(" ON UPDATE ").append(foreignKey.getOnUpdate());
+        }
+        if (foreignKey.getMatch() != null && !foreignKey.getMatch().isBlank()
+                && !"NONE".equalsIgnoreCase(foreignKey.getMatch())) {
+            definition.append(" MATCH ").append(foreignKey.getMatch());
         }
         return definition.toString();
     }
@@ -674,9 +849,7 @@ public class SqliteTableRebuilder {
 
     // ===================== Preservação de AUTOINCREMENT =====================
 
-    /**
-     * Lê a DDL original da tabela a partir de sqlite_master.sql.
-     */
+    /** Lê a DDL original da tabela a partir de sqlite_master.sql. */
     private static String readCreateTableSql(Connection connection, String tableName) throws SQLException {
         String createSql = null;
         try (PreparedStatement ps = connection.prepareStatement(
@@ -691,7 +864,7 @@ public class SqliteTableRebuilder {
 
     /**
      * Detecta colunas com AUTOINCREMENT na DDL original.
-     * Heurística segura para SQLite: só é válido quando a coluna é "INTEGER PRIMARY KEY AUTOINCREMENT".
+     * Heurística suficiente: só é válido quando a coluna é "INTEGER PRIMARY KEY AUTOINCREMENT".
      */
     private static Set<String> detectAutoIncrementColumns(String createTableSql,
                                                           Collection<String> candidatePrimaryKeyColumns) {
@@ -699,17 +872,14 @@ public class SqliteTableRebuilder {
         if (createTableSql == null || createTableSql.isBlank()) return autoIncrement;
 
         String ddlUpper = createTableSql.toUpperCase(Locale.ROOT);
-
         if (!ddlUpper.contains("AUTOINCREMENT")) return autoIncrement;
 
         for (String columnName : candidatePrimaryKeyColumns) {
-            // Procuramos tokens básicos na DDL original
             String quotedUpper = "\"" + columnName.replace("\"", "\"\"").toUpperCase(Locale.ROOT) + "\"";
             boolean appears     = ddlUpper.contains(quotedUpper);
             boolean isInteger   = ddlUpper.contains("INTEGER");
             boolean isPk        = ddlUpper.contains("PRIMARY KEY");
             boolean hasAutoInc  = ddlUpper.contains("AUTOINCREMENT");
-
             if (appears && isInteger && isPk && hasAutoInc) {
                 autoIncrement.add(columnName);
             }
