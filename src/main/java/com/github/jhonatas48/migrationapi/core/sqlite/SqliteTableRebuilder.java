@@ -1,31 +1,48 @@
 package com.github.jhonatas48.migrationapi.core.sqlite;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import javax.sql.DataSource;
 import java.sql.*;
 import java.util.*;
 import java.util.stream.Collectors;
 
 /**
- * Reconstrói tabelas no SQLite para embutir ALTERs de FK:
- * - Lê schema atual (PRAGMA table_info, foreign_key_list)
- * - Aplica remoções/adições de FKs
- * - Cria tabela temporária com o novo CREATE TABLE (inclui FKs)
- * - Copia dados, dropa original e renomeia
- * - Recria índices/uniques
+ * Reconstrói tabelas no SQLite para embutir alterações de chaves estrangeiras (FK):
+ * - Lê o schema atual (PRAGMA table_info, PRAGMA foreign_key_list)
+ * - Remove e adiciona FKs conforme solicitado
+ * - Cria tabela temporária com o novo CREATE TABLE (incluindo FKs)
+ * - Copia dados, remove a tabela original e renomeia a temporária
+ * - Recria índices (incluindo UNIQUE)
  *
- * Observações:
- * - Mantém colunas, NOT NULL, DEFAULT e PK conforme PRAGMA table_info
- * - Mantém FKs existentes, removendo as que vão cair e adicionando as novas
- * - Recria índices (inclusive UNIQUE) via PRAGMA index_list/index_info
+ * Boas práticas aplicadas:
+ * - Nomes descritivos e sem abreviações confusas
+ * - Extração de métodos para responsabilidades únicas (SRP/SoC)
+ * - Falhas com mensagens claras e diagnóstico completo
+ * - Garantias transacionais (commit/rollback) e restabelecimento de estado (foreign_keys/autoCommit)
  */
 public class SqliteTableRebuilder {
 
+    private static final Logger LOGGER = LoggerFactory.getLogger(SqliteTableRebuilder.class);
+
+    // PRAGMAs e SQLs usados em pontos críticos
+    private static final String PRAGMA_FOREIGN_KEYS_ON  = "PRAGMA foreign_keys=ON";
+    private static final String PRAGMA_FOREIGN_KEYS_OFF = "PRAGMA foreign_keys=OFF";
+    private static final String PRAGMA_TABLE_INFO       = "PRAGMA table_info(%s)";
+    private static final String PRAGMA_INDEX_LIST       = "PRAGMA index_list(%s)";
+    private static final String PRAGMA_INDEX_INFO       = "PRAGMA index_info(%s)";
+    private static final String PRAGMA_FK_LIST          = "PRAGMA foreign_key_list(%s)";
+    private static final String PRAGMA_FK_CHECK         = "PRAGMA foreign_key_check";
+
+    private static final String TEMP_TABLE_PREFIX       = "__tmp_";
+
     public static final class ForeignKeySpec {
-        private final String baseColumnsCsv;            // ex: "language_id"
-        private final String referencedTable;           // ex: "Language"
-        private final String referencedColumnsCsv;      // ex: "id"
-        private final String onDelete;                  // ex: "CASCADE" | "" -> ignora
-        private final String onUpdate;                  // ex: "NO ACTION" | "" -> ignora
+        private final String baseColumnsCsv;
+        private final String referencedTable;
+        private final String referencedColumnsCsv;
+        private final String onDeleteAction;
+        private final String onUpdateAction;
 
         public ForeignKeySpec(String baseColumnsCsv,
                               String referencedTable,
@@ -35,21 +52,26 @@ public class SqliteTableRebuilder {
             this.baseColumnsCsv = baseColumnsCsv;
             this.referencedTable = referencedTable;
             this.referencedColumnsCsv = referencedColumnsCsv;
-            this.onDelete = onDelete;
-            this.onUpdate = onUpdate;
+            this.onDeleteAction = onDelete;
+            this.onUpdateAction = onUpdate;
         }
 
-        public String getBaseColumnsCsv() { return baseColumnsCsv; }
-        public String getReferencedTable() { return referencedTable; }
+        public String getBaseColumnsCsv()       { return baseColumnsCsv; }
+        public String getReferencedTable()      { return referencedTable; }
         public String getReferencedColumnsCsv() { return referencedColumnsCsv; }
-        public String getOnDelete() { return onDelete; }
-        public String getOnUpdate() { return onUpdate; }
+        public String getOnDelete()             { return onDeleteAction; }
+        public String getOnUpdate()             { return onUpdateAction; }
 
         @Override
         public String toString() {
-            return baseColumnsCsv + " -> " + referencedTable + "(" + referencedColumnsCsv + ")"
-                    + (onDelete == null || onDelete.isBlank() ? "" : " ON DELETE " + onDelete)
-                    + (onUpdate == null || onUpdate.isBlank() ? "" : " ON UPDATE " + onUpdate);
+            StringBuilder description = new StringBuilder();
+            description.append(baseColumnsCsv)
+                    .append(" -> ")
+                    .append(referencedTable)
+                    .append("(").append(referencedColumnsCsv).append(")");
+            if (onDeleteAction != null && !onDeleteAction.isBlank()) description.append(" ON DELETE ").append(onDeleteAction);
+            if (onUpdateAction != null && !onUpdateAction.isBlank()) description.append(" ON UPDATE ").append(onUpdateAction);
+            return description.toString();
         }
     }
 
@@ -59,268 +81,480 @@ public class SqliteTableRebuilder {
         this.dataSource = dataSource;
     }
 
+    /**
+     * Reconstrói a tabela para aplicar adições e remoções de FKs.
+     *
+     * @param tableName          Nome da tabela a reconstruir
+     * @param foreignKeysToAdd   FKs a adicionar
+     * @param foreignKeysToDrop  FKs a remover
+     */
     public void rebuildTableApplyingForeignKeyChanges(String tableName,
                                                       List<ForeignKeySpec> foreignKeysToAdd,
                                                       List<ForeignKeySpec> foreignKeysToDrop) throws SQLException {
-
         try (Connection connection = dataSource.getConnection()) {
+            boolean previousAutoCommit = connection.getAutoCommit();
             connection.setAutoCommit(false);
 
             try {
-                execute(connection, "PRAGMA foreign_keys=OFF");
+                disableForeignKeyEnforcement(connection);
 
-                TableInfo tableInfo = readCurrentTableInfo(connection, tableName);
-                if (tableInfo.columns.isEmpty()) {
+                TableSchema currentSchema = readCurrentTableSchema(connection, tableName);
+                if (currentSchema.columns.isEmpty()) {
                     throw new IllegalStateException("Tabela não encontrada ou sem colunas: " + tableName);
                 }
 
-                List<ForeignKeySpec> initialFks = readCurrentForeignKeys(connection, tableName);
+                List<ForeignKeySpec> finalForeignKeys = computeFinalForeignKeys(
+                        readCurrentForeignKeys(connection, tableName),
+                        foreignKeysToAdd,
+                        foreignKeysToDrop
+                );
 
-                // Remove as FKs que devem cair
-                List<ForeignKeySpec> remainingFks = new ArrayList<>(initialFks);
-                for (ForeignKeySpec toDrop : foreignKeysToDrop) {
-                    remainingFks.removeIf(existing ->
-                            sameFkByColumns(existing, toDrop) ||
-                                    sameFkByTarget(existing, toDrop)
-                    );
-                }
+                String tempTableName = TEMP_TABLE_PREFIX + tableName;
+                String createTempSql = buildCreateTableStatement(tableName, currentSchema, finalForeignKeys, tempTableName);
 
-                // Adiciona novas FKs
-                remainingFks.addAll(foreignKeysToAdd);
+                List<IndexDefinition> currentIndexes = readCurrentIndexes(connection, tableName);
 
-                // Monta CREATE TABLE com colunas + PK + FKs (remainingFks)
-                String createSql = buildCreateTableWithFks(tableName, tableInfo, remainingFks, "__tmp_" + tableName);
+                createTemporaryTable(connection, createTempSql);
+                copyDataSameColumns(connection, tableName, tempTableName, currentSchema);
+                dropOriginalTable(connection, tableName);
+                renameTemporaryTable(connection, tempTableName, tableName);
+                recreateIndexes(connection, tableName, currentIndexes);
 
-                // Índices existentes (para recriar depois)
-                List<IndexInfo> indexes = readIndexes(connection, tableName);
-
-                // Cria tabela temporária, copia, dropa e renomeia
-                execute(connection, createSql);
-
-                String columnList = tableInfo.columns.stream()
-                        .map(c -> quote(c.name))
-                        .collect(Collectors.joining(", "));
-                execute(connection, "INSERT INTO " + quote("__tmp_" + tableName) +
-                        "(" + columnList + ") SELECT " + columnList + " FROM " + quote(tableName));
-                execute(connection, "DROP TABLE " + quote(tableName));
-                execute(connection, "ALTER TABLE " + quote("__tmp_" + tableName) + " RENAME TO " + quote(tableName));
-
-                // Recria índices
-                for (IndexInfo idx : indexes) {
-                    if (idx.isOriginPk) continue; // PK já foi incluída no CREATE TABLE
-                    String idxName = idx.name;
-                    String cols = idx.columns.stream().map(SqliteTableRebuilder::quote).collect(Collectors.joining(", "));
-                    String unique = idx.unique ? "UNIQUE " : "";
-                    execute(connection, "CREATE " + unique + "INDEX " + quote(idxName) + " ON " + quote(tableName) + " (" + cols + ")");
-                }
-
-                execute(connection, "PRAGMA foreign_keys=ON");
+                enableForeignKeyEnforcement(connection);
+                validateReferentialIntegrityOrFail(connection, tableName);
 
                 connection.commit();
-            } catch (Throwable t) {
-                connection.rollback();
-                throw t;
+                LOGGER.info("Rebuild da tabela '{}' concluído com sucesso.", tableName);
+            } catch (Throwable failure) {
+                safeRollback(connection);
+                // Garante que não deixe a conexão com FK desligado
+                safelyExecute(connection, PRAGMA_FOREIGN_KEYS_ON);
+                throw failure;
             } finally {
-                connection.setAutoCommit(true);
+                // Restaura estado
+                safelyExecute(connection, PRAGMA_FOREIGN_KEYS_ON);
+                connection.setAutoCommit(previousAutoCommit);
             }
         }
     }
 
-    private boolean sameFkByColumns(ForeignKeySpec a, ForeignKeySpec b) {
+    // ========== Camada de Orquestração (intencionalmente explícita) ==========
+
+    private void disableForeignKeyEnforcement(Connection connection) throws SQLException {
+        executeStatement(connection, PRAGMA_FOREIGN_KEYS_OFF);
+    }
+
+    private void enableForeignKeyEnforcement(Connection connection) throws SQLException {
+        executeStatement(connection, PRAGMA_FOREIGN_KEYS_ON);
+    }
+
+    private void createTemporaryTable(Connection connection, String createTempSql) throws SQLException {
+        executeStatement(connection, createTempSql);
+    }
+
+    private void copyDataSameColumns(Connection connection, String sourceTable, String targetTempTable, TableSchema schema) throws SQLException {
+        String columnList = schema.columns.stream()
+                .map(column -> quoteIdentifier(column.name))
+                .collect(Collectors.joining(", "));
+        String insertSql = "INSERT INTO " + quoteIdentifier(targetTempTable)
+                + "(" + columnList + ") SELECT " + columnList + " FROM " + quoteIdentifier(sourceTable);
+        executeStatement(connection, insertSql);
+    }
+
+    private void dropOriginalTable(Connection connection, String tableName) throws SQLException {
+        executeStatement(connection, "DROP TABLE " + quoteIdentifier(tableName));
+    }
+
+    private void renameTemporaryTable(Connection connection, String tempTableName, String finalName) throws SQLException {
+        executeStatement(connection, "ALTER TABLE " + quoteIdentifier(tempTableName) + " RENAME TO " + quoteIdentifier(finalName));
+    }
+
+    private void recreateIndexes(Connection connection, String tableName, List<IndexDefinition> previousIndexes) throws SQLException {
+        for (IndexDefinition index : previousIndexes) {
+            if (index.createdFromPrimaryKey) continue; // PK já está no CREATE TABLE
+            String indexColumns = index.columns.stream().map(SqliteTableRebuilder::quoteIdentifier).collect(Collectors.joining(", "));
+            String uniqueClause = index.unique ? "UNIQUE " : "";
+            String createIndexSql = "CREATE " + uniqueClause + "INDEX " + quoteIdentifier(index.name)
+                    + " ON " + quoteIdentifier(tableName) + " (" + indexColumns + ")";
+            executeStatement(connection, createIndexSql);
+        }
+    }
+
+    private void validateReferentialIntegrityOrFail(Connection connection, String tableNameJustRebuilt) throws SQLException {
+        List<ForeignKeyViolation> violations = runForeignKeyCheck(connection);
+        if (violations.isEmpty()) return;
+
+        String errorMessage = buildForeignKeyViolationMessage(tableNameJustRebuilt, violations, connection);
+        LOGGER.error(errorMessage);
+        throw new IllegalStateException(errorMessage);
+    }
+
+    // ========== Cálculo de FKs Finais ==========
+
+    private List<ForeignKeySpec> computeFinalForeignKeys(List<ForeignKeySpec> currentForeignKeys,
+                                                         List<ForeignKeySpec> toAdd,
+                                                         List<ForeignKeySpec> toDrop) {
+        List<ForeignKeySpec> result = new ArrayList<>(currentForeignKeys);
+        for (ForeignKeySpec dropSpec : toDrop) {
+            result.removeIf(existing ->
+                    areSameByBaseColumns(existing, dropSpec) || areSameByReferencedTarget(existing, dropSpec)
+            );
+        }
+        result.addAll(toAdd);
+        return result;
+    }
+
+    private boolean areSameByBaseColumns(ForeignKeySpec a, ForeignKeySpec b) {
         return normalizeCsv(a.baseColumnsCsv).equalsIgnoreCase(normalizeCsv(b.baseColumnsCsv));
     }
-    private boolean sameFkByTarget(ForeignKeySpec a, ForeignKeySpec b) {
+
+    private boolean areSameByReferencedTarget(ForeignKeySpec a, ForeignKeySpec b) {
         return a.referencedTable.equalsIgnoreCase(b.referencedTable)
                 && normalizeCsv(a.referencedColumnsCsv).equalsIgnoreCase(normalizeCsv(b.referencedColumnsCsv));
     }
+
     private static String normalizeCsv(String csv) {
         return Arrays.stream(csv.split(","))
                 .map(String::trim)
                 .collect(Collectors.joining(","));
     }
 
-    private static class TableInfo {
-        static class Column {
-            final String name;
-            final String type;
-            final boolean notNull;
-            final String defaultValue; // pode vir como expressão
-            final boolean primaryKey;
+    // ========== Modelos internos com nomes claros ==========
 
-            Column(String name, String type, boolean notNull, String defaultValue, boolean primaryKey) {
-                this.name = name;
-                this.type = type;
-                this.notNull = notNull;
-                this.defaultValue = defaultValue;
-                this.primaryKey = primaryKey;
-            }
-        }
-        final List<Column> columns = new ArrayList<>();
+    private static final class TableSchema {
+        private final List<TableColumn> columns = new ArrayList<>();
     }
 
-    private static class IndexInfo {
-        final String name;
-        final boolean unique;
-        final boolean isOriginPk;
-        final List<String> columns = new ArrayList<>();
+    private static final class TableColumn {
+        private final String name;
+        private final String typeDeclaration;
+        private final boolean notNull;
+        private final String defaultExpression; // pode ser literal ou expressão
+        private final boolean partOfPrimaryKey;
 
-        IndexInfo(String name, boolean unique, boolean isOriginPk) {
+        private TableColumn(String name, String typeDeclaration, boolean notNull, String defaultExpression, boolean partOfPrimaryKey) {
+            this.name = name;
+            this.typeDeclaration = typeDeclaration;
+            this.notNull = notNull;
+            this.defaultExpression = defaultExpression;
+            this.partOfPrimaryKey = partOfPrimaryKey;
+        }
+    }
+
+    private static final class IndexDefinition {
+        private final String name;
+        private final boolean unique;
+        private final boolean createdFromPrimaryKey; // origin == 'pk'
+        private final List<String> columns = new ArrayList<>();
+
+        private IndexDefinition(String name, boolean unique, boolean createdFromPrimaryKey) {
             this.name = name;
             this.unique = unique;
-            this.isOriginPk = isOriginPk;
+            this.createdFromPrimaryKey = createdFromPrimaryKey;
         }
     }
 
-    private TableInfo readCurrentTableInfo(Connection c, String table) throws SQLException {
-        TableInfo info = new TableInfo();
-        try (PreparedStatement ps = c.prepareStatement("PRAGMA table_info(" + quote(table) + ")")) {
-            try (ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    String name = rs.getString("name");
-                    String type = rs.getString("type");
-                    boolean notnull = rs.getInt("notnull") == 1;
-                    String dflt = rs.getString("dflt_value");
-                    boolean pk = rs.getInt("pk") == 1;
-                    info.columns.add(new TableInfo.Column(name, type, notnull, dflt, pk));
-                }
+    private static final class ForeignKeyRow {
+        private final String referencedTable;
+        private final String baseColumn;
+        private final String referencedColumn;
+        private final String onUpdateAction;
+        private final String onDeleteAction;
+
+        private ForeignKeyRow(String referencedTable, String baseColumn, String referencedColumn,
+                              String onUpdateAction, String onDeleteAction) {
+            this.referencedTable = referencedTable;
+            this.baseColumn = baseColumn;
+            this.referencedColumn = referencedColumn;
+            this.onUpdateAction = onUpdateAction;
+            this.onDeleteAction = onDeleteAction;
+        }
+    }
+
+    private static final class ForeignKeyViolation {
+        private final String violatingTable;
+        private final long violatingRowId;
+        private final String referencedParentTable;
+        private final int foreignKeyId;
+
+        private ForeignKeyViolation(String violatingTable, long violatingRowId, String referencedParentTable, int foreignKeyId) {
+            this.violatingTable = violatingTable;
+            this.violatingRowId = violatingRowId;
+            this.referencedParentTable = referencedParentTable;
+            this.foreignKeyId = foreignKeyId;
+        }
+    }
+
+    // ========== Leitura de Metadados do SQLite ==========
+
+    private TableSchema readCurrentTableSchema(Connection connection, String tableName) throws SQLException {
+        TableSchema schema = new TableSchema();
+        String sql = String.format(PRAGMA_TABLE_INFO, quoteIdentifier(tableName));
+
+        try (PreparedStatement statement = connection.prepareStatement(sql);
+             ResultSet resultSet = statement.executeQuery()) {
+            while (resultSet.next()) {
+                String columnName = resultSet.getString("name");
+                String typeDeclaration = resultSet.getString("type");
+                boolean notNull = resultSet.getInt("notnull") == 1;
+                String defaultExpr = resultSet.getString("dflt_value");
+                boolean isPrimaryKey = resultSet.getInt("pk") == 1;
+
+                schema.columns.add(new TableColumn(columnName, typeDeclaration, notNull, defaultExpr, isPrimaryKey));
             }
         }
-        return info;
+        return schema;
     }
 
-    private List<ForeignKeySpec> readCurrentForeignKeys(Connection c, String table) throws SQLException {
-        List<ForeignKeySpec> out = new ArrayList<>();
-        try (PreparedStatement ps = c.prepareStatement("PRAGMA foreign_key_list(" + quote(table) + ")")) {
-            try (ResultSet rs = ps.executeQuery()) {
-                Map<Integer, List<Row>> grouped = new LinkedHashMap<>();
-                while (rs.next()) {
-                    int id = rs.getInt("id");
-                    String tableRef = rs.getString("table");
-                    String fromCol = rs.getString("from");
-                    String toCol = rs.getString("to");
-                    String onUpdate = rs.getString("on_update");
-                    String onDelete = rs.getString("on_delete");
-                    grouped.computeIfAbsent(id, k -> new ArrayList<>()).add(new Row(tableRef, fromCol, toCol, onUpdate, onDelete));
-                }
-                for (List<Row> rows : grouped.values()) {
-                    String refTable = rows.get(0).tableRef;
-                    String onUpdate = rows.get(0).onUpdate;
-                    String onDelete = rows.get(0).onDelete;
+    private List<ForeignKeySpec> readCurrentForeignKeys(Connection connection, String tableName) throws SQLException {
+        Map<Integer, List<ForeignKeyRow>> byConstraintId = new LinkedHashMap<>();
+        String sql = String.format(PRAGMA_FK_LIST, quoteIdentifier(tableName));
 
-                    String baseCols = rows.stream().map(r -> r.fromCol).collect(Collectors.joining(","));
-                    String refCols  = rows.stream().map(r -> r.toCol).collect(Collectors.joining(","));
-                    out.add(new ForeignKeySpec(baseCols, refTable, refCols, onDelete, onUpdate));
-                }
+        try (PreparedStatement statement = connection.prepareStatement(sql);
+             ResultSet result = statement.executeQuery()) {
+
+            while (result.next()) {
+                int constraintId = result.getInt("id");
+                String refTable = result.getString("table");
+                String baseColumn = result.getString("from");
+                String refColumn = result.getString("to");
+                String onUpdate = result.getString("on_update");
+                String onDelete = result.getString("on_delete");
+
+                byConstraintId.computeIfAbsent(constraintId, k -> new ArrayList<>())
+                        .add(new ForeignKeyRow(refTable, baseColumn, refColumn, onUpdate, onDelete));
             }
         }
-        return out;
-    }
 
-    private static class Row {
-        final String tableRef;
-        final String fromCol;
-        final String toCol;
-        final String onUpdate;
-        final String onDelete;
-        Row(String tableRef, String fromCol, String toCol, String onUpdate, String onDelete) {
-            this.tableRef = tableRef; this.fromCol = fromCol; this.toCol = toCol; this.onUpdate = onUpdate; this.onDelete = onDelete;
+        List<ForeignKeySpec> foreignKeys = new ArrayList<>();
+        for (List<ForeignKeyRow> rowsOfConstraint : byConstraintId.values()) {
+            String referencedTable = rowsOfConstraint.get(0).referencedTable;
+            String onUpdate = rowsOfConstraint.get(0).onUpdateAction;
+            String onDelete = rowsOfConstraint.get(0).onDeleteAction;
+
+            String baseColumnsCsv = rowsOfConstraint.stream().map(r -> r.baseColumn).collect(Collectors.joining(","));
+            String referencedColumnsCsv = rowsOfConstraint.stream().map(r -> r.referencedColumn).collect(Collectors.joining(","));
+
+            foreignKeys.add(new ForeignKeySpec(baseColumnsCsv, referencedTable, referencedColumnsCsv, onDelete, onUpdate));
         }
+
+        return foreignKeys;
     }
 
-    private List<IndexInfo> readIndexes(Connection c, String table) throws SQLException {
-        List<IndexInfo> out = new ArrayList<>();
-        try (PreparedStatement ps = c.prepareStatement("PRAGMA index_list(" + quote(table) + ")")) {
-            try (ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    String name = rs.getString("name");
-                    boolean unique = rs.getInt("unique") == 1;
-                    String origin = rs.getString("origin"); // 'pk' para primary key implícita
-                    IndexInfo idx = new IndexInfo(name, unique, "pk".equalsIgnoreCase(origin));
-                    out.add(idx);
+    private List<IndexDefinition> readCurrentIndexes(Connection connection, String tableName) throws SQLException {
+        List<IndexDefinition> indexes = new ArrayList<>();
+        String sql = String.format(PRAGMA_INDEX_LIST, quoteIdentifier(tableName));
 
-                    if (!idx.isOriginPk) {
-                        try (PreparedStatement ps2 = c.prepareStatement("PRAGMA index_info(" + quote(name) + ")")) {
-                            try (ResultSet rs2 = ps2.executeQuery()) {
-                                while (rs2.next()) {
-                                    idx.columns.add(rs2.getString("name"));
-                                }
-                            }
+        try (PreparedStatement statement = connection.prepareStatement(sql);
+             ResultSet result = statement.executeQuery()) {
+
+            while (result.next()) {
+                String indexName = result.getString("name");
+                boolean isUnique = result.getInt("unique") == 1;
+                String origin = result.getString("origin"); // 'pk' quando deriva da PK
+                IndexDefinition indexDefinition = new IndexDefinition(indexName, isUnique, "pk".equalsIgnoreCase(origin));
+                indexes.add(indexDefinition);
+
+                if (!indexDefinition.createdFromPrimaryKey) {
+                    String indexInfoSql = String.format(PRAGMA_INDEX_INFO, quoteIdentifier(indexName));
+                    try (PreparedStatement columnsStmt = connection.prepareStatement(indexInfoSql);
+                         ResultSet columnsRs = columnsStmt.executeQuery()) {
+                        while (columnsRs.next()) {
+                            indexDefinition.columns.add(columnsRs.getString("name"));
                         }
                     }
                 }
             }
         }
-        return out;
+
+        return indexes;
     }
 
-    private String buildCreateTableWithFks(String originalTable,
-                                           TableInfo tableInfo,
-                                           List<ForeignKeySpec> fks,
-                                           String tempName) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("CREATE TABLE ").append(quote(tempName)).append(" (\n");
+    // ========== Construção do CREATE TABLE (claro e declarativo) ==========
 
-        // Colunas (com PK inline quando a PK é single-column; para PK composta, aplicamos no final)
-        List<String> pkCols = tableInfo.columns.stream()
-                .filter(c -> c.primaryKey)
-                .map(c -> c.name)
+    private String buildCreateTableStatement(String originalTableName,
+                                             TableSchema schema,
+                                             List<ForeignKeySpec> foreignKeys,
+                                             String tempTableName) {
+        StringBuilder create = new StringBuilder();
+        create.append("CREATE TABLE ").append(quoteIdentifier(tempTableName)).append(" (\n");
+
+        List<String> primaryKeyColumns = schema.columns.stream()
+                .filter(column -> column.partOfPrimaryKey)
+                .map(column -> column.name)
                 .collect(Collectors.toList());
 
-        List<String> columnDefs = new ArrayList<>();
-        for (SqliteTableRebuilder.TableInfo.Column c : tableInfo.columns) {
-            StringBuilder col = new StringBuilder();
-            col.append("  ").append(quote(c.name)).append(" ").append(c.type == null ? "" : c.type);
+        List<String> columnDefinitions = new ArrayList<>();
 
-            // PK de uma coluna pode vir inline (SQLite aceita)
-            if (pkCols.size() == 1 && c.primaryKey) {
-                col.append(" PRIMARY KEY");
-            }
-            if (c.notNull) col.append(" NOT NULL");
-            if (c.defaultValue != null) col.append(" DEFAULT ").append(c.defaultValue);
-            columnDefs.add(col.toString());
+        for (TableColumn column : schema.columns) {
+            columnDefinitions.add(buildColumnDefinition(primaryKeyColumns, column));
         }
 
-        // PK composta
-        if (pkCols.size() > 1) {
-            String pk = pkCols.stream().map(SqliteTableRebuilder::quote).collect(Collectors.joining(", "));
-            columnDefs.add("  PRIMARY KEY (" + pk + ")");
+        if (primaryKeyColumns.size() > 1) {
+            String pkList = primaryKeyColumns.stream().map(SqliteTableRebuilder::quoteIdentifier).collect(Collectors.joining(", "));
+            columnDefinitions.add("  PRIMARY KEY (" + pkList + ")");
         }
 
-        // FKs
-        for (ForeignKeySpec fk : fks) {
+        for (ForeignKeySpec fk : foreignKeys) {
             if (fk.getReferencedTable() == null || fk.getReferencedTable().isBlank()) continue;
-            String baseCols = Arrays.stream(fk.getBaseColumnsCsv().split(",")).map(String::trim)
-                    .map(SqliteTableRebuilder::quote).collect(Collectors.joining(", "));
-            String refCols  = Arrays.stream(fk.getReferencedColumnsCsv().split(",")).map(String::trim)
-                    .map(SqliteTableRebuilder::quote).collect(Collectors.joining(", "));
-
-            StringBuilder fkDef = new StringBuilder();
-            fkDef.append("  FOREIGN KEY (").append(baseCols).append(")")
-                    .append(" REFERENCES ").append(quote(fk.getReferencedTable()))
-                    .append(" (").append(refCols).append(")");
-
-            if (fk.getOnDelete() != null && !fk.getOnDelete().isBlank()) {
-                fkDef.append(" ON DELETE ").append(fk.getOnDelete());
-            }
-            if (fk.getOnUpdate() != null && !fk.getOnUpdate().isBlank()) {
-                fkDef.append(" ON UPDATE ").append(fk.getOnUpdate());
-            }
-
-            columnDefs.add(fkDef.toString());
+            columnDefinitions.add(buildForeignKeyDefinition(fk));
         }
 
-        sb.append(String.join(",\n", columnDefs)).append("\n)");
+        create.append(String.join(",\n", columnDefinitions)).append("\n)");
+        return create.toString();
+    }
+
+    private String buildColumnDefinition(List<String> primaryKeyColumns, TableColumn column) {
+        StringBuilder definition = new StringBuilder();
+        definition.append("  ").append(quoteIdentifier(column.name)).append(" ")
+                .append(column.typeDeclaration == null ? "" : column.typeDeclaration);
+
+        boolean singleColumnPrimaryKey = primaryKeyColumns.size() == 1 && column.partOfPrimaryKey;
+        if (singleColumnPrimaryKey) {
+            definition.append(" PRIMARY KEY");
+        }
+        if (column.notNull) {
+            definition.append(" NOT NULL");
+        }
+        if (column.defaultExpression != null) {
+            definition.append(" DEFAULT ").append(column.defaultExpression);
+        }
+        return definition.toString();
+    }
+
+    private String buildForeignKeyDefinition(ForeignKeySpec foreignKey) {
+        String baseColumnList = Arrays.stream(foreignKey.getBaseColumnsCsv().split(","))
+                .map(String::trim)
+                .map(SqliteTableRebuilder::quoteIdentifier)
+                .collect(Collectors.joining(", "));
+
+        String referencedColumnList = Arrays.stream(foreignKey.getReferencedColumnsCsv().split(","))
+                .map(String::trim)
+                .map(SqliteTableRebuilder::quoteIdentifier)
+                .collect(Collectors.joining(", "));
+
+        StringBuilder definition = new StringBuilder();
+        definition.append("  FOREIGN KEY (").append(baseColumnList).append(")")
+                .append(" REFERENCES ").append(quoteIdentifier(foreignKey.getReferencedTable()))
+                .append(" (").append(referencedColumnList).append(")");
+
+        if (foreignKey.getOnDelete() != null && !foreignKey.getOnDelete().isBlank()) {
+            definition.append(" ON DELETE ").append(foreignKey.getOnDelete());
+        }
+        if (foreignKey.getOnUpdate() != null && !foreignKey.getOnUpdate().isBlank()) {
+            definition.append(" ON UPDATE ").append(foreignKey.getOnUpdate());
+        }
+        return definition.toString();
+    }
+
+    // ========== Diagnóstico de Integridade Referencial ==========
+
+    private List<ForeignKeyViolation> runForeignKeyCheck(Connection connection) {
+        List<ForeignKeyViolation> violations = new ArrayList<>();
+        try (Statement statement = connection.createStatement();
+             ResultSet result = statement.executeQuery(PRAGMA_FK_CHECK)) {
+            while (result.next()) {
+                String table = safeGetString(result, "table");
+                long rowId = safeGetLong(result, "rowid");
+                String parent = safeGetString(result, "parent");
+                int foreignKeyId = safeGetInt(result, "fkid");
+                violations.add(new ForeignKeyViolation(table, rowId, parent, foreignKeyId));
+            }
+        } catch (SQLException e) {
+            LOGGER.warn("Falha ao executar PRAGMA foreign_key_check: {}", e.getMessage());
+        }
+        return violations;
+    }
+
+    private String buildForeignKeyViolationMessage(String rebuiltTable,
+                                                   List<ForeignKeyViolation> violations,
+                                                   Connection connection) {
+        String header = "Violação(ões) de integridade referencial após rebuild da tabela '" + rebuiltTable + "'.";
+        String details = violations.stream()
+                .map(v -> "table=" + v.violatingTable + ", rowid=" + v.violatingRowId + ", parent=" + v.referencedParentTable + ", fkid=" + v.foreignKeyId)
+                .collect(Collectors.joining("\n"));
+
+        String definitions = buildForeignKeyDefinitionsForTables(connection, violations);
+        return header + "\n" + details + definitions;
+    }
+
+    private String buildForeignKeyDefinitionsForTables(Connection connection, List<ForeignKeyViolation> violations) {
+        Set<String> tables = violations.stream()
+                .map(v -> v.violatingTable)
+                .filter(Objects::nonNull)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+
+        if (tables.isEmpty()) return "";
+
+        StringBuilder sb = new StringBuilder("\n\nDefinições de FKs para inspeção:\n");
+        for (String table : tables) {
+            sb.append(" - ").append(table).append(":\n");
+            String sql = String.format(PRAGMA_FK_LIST, quoteIdentifier(table));
+            try (Statement statement = connection.createStatement();
+                 ResultSet rs = statement.executeQuery(sql)) {
+                while (rs.next()) {
+                    int id = safeGetInt(rs, "id");
+                    int seq = safeGetInt(rs, "seq");
+                    String parent = safeGetString(rs, "table");
+                    String from = safeGetString(rs, "from");
+                    String to = safeGetString(rs, "to");
+                    String onUpdate = safeGetString(rs, "on_update");
+                    String onDelete = safeGetString(rs, "on_delete");
+                    String match = safeGetString(rs, "match");
+
+                    sb.append("    id=").append(id)
+                            .append(" seq=").append(seq)
+                            .append(" from=").append(from)
+                            .append(" -> ").append(parent).append("(").append(to).append(")")
+                            .append(" on_update=").append(onUpdate)
+                            .append(" on_delete=").append(onDelete)
+                            .append(" match=").append(match)
+                            .append('\n');
+                }
+            } catch (SQLException e) {
+                sb.append("    (falha ao ler foreign_key_list: ").append(e.getMessage()).append(")\n");
+            }
+        }
         return sb.toString();
     }
 
-    private static void execute(Connection c, String sql) throws SQLException {
-        try (Statement st = c.createStatement()) {
+    // ========== Utilidades de Execução SQL e Segurança de Estado ==========
+
+    private static void executeStatement(Connection connection, String sql) throws SQLException {
+        try (Statement st = connection.createStatement()) {
             st.execute(sql);
         }
     }
 
-    private static String quote(String id) {
-        // Aspas duplas preservam case e evitam conflitos com keywords
-        return "\"" + id.replace("\"", "\"\"") + "\"";
+    private static void safelyExecute(Connection connection, String sql) {
+        try (Statement st = connection.createStatement()) {
+            st.execute(sql);
+        } catch (SQLException e) {
+            // Não propaga — usado em finally/recuperação
+        }
+    }
+
+    private static void safeRollback(Connection connection) {
+        try {
+            connection.rollback();
+        } catch (SQLException e) {
+            // evita mascarar o erro original
+        }
+    }
+
+    private static String quoteIdentifier(String identifier) {
+        return "\"" + identifier.replace("\"", "\"\"") + "\"";
+    }
+
+    private static String safeGetString(ResultSet rs, String column) {
+        try { String v = rs.getString(column); return v == null ? "" : v; } catch (SQLException e) { return ""; }
+    }
+
+    private static int safeGetInt(ResultSet rs, String column) {
+        try { return rs.getInt(column); } catch (SQLException e) { return -1; }
+    }
+
+    private static long safeGetLong(ResultSet rs, String column) {
+        try { return rs.getLong(column); } catch (SQLException e) { return -1L; }
     }
 }
