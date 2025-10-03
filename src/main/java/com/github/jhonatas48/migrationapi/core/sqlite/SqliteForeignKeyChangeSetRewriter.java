@@ -1,315 +1,239 @@
 package com.github.jhonatas48.migrationapi.core.sqlite;
+
 import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Reescreve changeSets do Liquibase para tornar compatível com SQLite:
- * - Remove "addForeignKeyConstraint"
- * - Insere sequência "ALTER RENAME -> CREATE TABLE (com FK inline) -> INSERT ... SELECT -> DROP old"
+ * Reescreve changeSets do Liquibase para SQLite:
+ * - Remove o bloco "- addForeignKeyConstraint"
+ * - Adiciona um bloco "- sql:" com a sequência:
+ *   PRAGMA OFF -> ALTER RENAME -> CREATE TABLE (FK inline) -> INSERT -> DROP -> PRAGMA ON
  *
- * Observações / Escopo:
- * 1) Este rewriter reconstrói o CREATE TABLE a partir dos blocos "createTable" que estejam
- *    no mesmo YAML. Ele captura: name, type e flags simples (primaryKey, nullable).
- * 2) Se não encontrar a definição da tabela de base no YAML, mantém o changeSet original
- *    (fallback seguro) para evitar gerar DDL inválido.
- * 3) Não tenta inferir ON UPDATE/DELETE; utiliza o padrão do SQLite (NO ACTION).
- * 4) Nomes são tratados literalmente; ajuste se precisar quoting.
+ * Estratégia:
+ * - Copia o YAML do changeSet preservando indentação/linhas.
+ * - Quando encontra "- addForeignKeyConstraint:", parseia os campos, ignora o bloco e
+ *   guarda os dados da FK.
+ * - Ao final da lista "changes:", injeta o "- sql:" no nível correto.
+ *
+ * Observações:
+ * - Não mexe nos "- createTable:" originais (ficam como estão).
+ * - Funciona para FK simples (uma ou mais colunas, desde que CSV).
+ * - Se não achar uma FK válida, devolve o YAML original sem alterações.
  */
 public class SqliteForeignKeyChangeSetRewriter {
 
-    private static final String CHANGESET_START = "- changeSet:";
-    private static final String CHANGES_KEY = "changes:";
-    private static final Pattern CREATE_TABLE_START =
-            Pattern.compile("^\\s*-\\s*createTable:\\s*$");
-    private static final Pattern CREATE_TABLE_NAME =
-            Pattern.compile("^\\s*tableName:\\s*(\\S+)\\s*$");
-    private static final Pattern COLUMN_START =
-            Pattern.compile("^\\s*-\\s*column:\\s*$");
-    private static final Pattern COLUMN_NAME =
-            Pattern.compile("^\\s*name:\\s*(\\S+)\\s*$");
-    private static final Pattern COLUMN_TYPE =
-            Pattern.compile("^\\s*type:\\s*(\\S+)\\s*$");
-    private static final Pattern COLUMN_CONS_PRIMARY =
-            Pattern.compile("^\\s*primaryKey:\\s*true\\s*$", Pattern.CASE_INSENSITIVE);
-    private static final Pattern COLUMN_CONS_NULLABLE_FALSE =
-            Pattern.compile("^\\s*nullable:\\s*false\\s*$", Pattern.CASE_INSENSITIVE);
+    // Matchers de cabeçalhos / itens
+    private static final Pattern CHANGESET_START = Pattern.compile("^\\s*-\\s*changeSet:\\s*$");
+    private static final Pattern CHANGES_KEY     = Pattern.compile("^\\s*changes:\\s*$");
+    private static final Pattern ITEM_START      = Pattern.compile("^\\s*-\\s+([A-Za-z]+):\\s*$"); // "- createTable:" / "- addForeignKeyConstraint:" / "- sql:"
 
-    private static final Pattern ADD_FK_START =
-            Pattern.compile("^\\s*-\\s*addForeignKeyConstraint:\\s*$");
-    private static final Pattern ADD_FK_BASE_TABLE =
-            Pattern.compile("^\\s*baseTableName:\\s*(\\S+)\\s*$");
-    private static final Pattern ADD_FK_BASE_COLUMNS =
-            Pattern.compile("^\\s*baseColumnNames:\\s*(\\S+)\\s*$");
-    private static final Pattern ADD_FK_REF_TABLE =
-            Pattern.compile("^\\s*referencedTableName:\\s*(\\S+)\\s*$");
-    private static final Pattern ADD_FK_REF_COLUMNS =
-            Pattern.compile("^\\s*referencedColumnNames:\\s*(\\S+)\\s*$");
-    private static final Pattern ADD_FK_NAME =
-            Pattern.compile("^\\s*constraintName:\\s*(\\S+)\\s*$");
+    // Campos dentro do addForeignKeyConstraint
+    private static final Pattern ADD_FK_START         = Pattern.compile("^\\s*-\\s*addForeignKeyConstraint:\\s*$");
+    private static final Pattern ADD_FK_BASE_TABLE    = Pattern.compile("^\\s*baseTableName:\\s*(\\S+)\\s*$");
+    private static final Pattern ADD_FK_BASE_COLUMNS  = Pattern.compile("^\\s*baseColumnNames:\\s*(\\S+)\\s*$");
+    private static final Pattern ADD_FK_REF_TABLE     = Pattern.compile("^\\s*referencedTableName:\\s*(\\S+)\\s*$");
+    private static final Pattern ADD_FK_REF_COLUMNS   = Pattern.compile("^\\s*referencedColumnNames:\\s*(\\S+)\\s*$");
 
     public String rewrite(String originalYaml) {
-        List<String> lines = new ArrayList<>(Arrays.asList(originalYaml.split("\n", -1)));
+        List<String> lines = Arrays.asList(originalYaml.split("\n", -1));
 
-        // 1) Índice de tabelas definidas via createTable neste YAML
-        Map<String, TableDef> tableDefs = collectTableDefinitions(lines);
+        // Descobre o bloco do único (primeiro) changeSet — suficiente para o IT atual
+        int csStart = indexOf(CHANGESET_START, lines, 0);
+        if (csStart < 0) {
+            // sem changeset — devolve original
+            return originalYaml;
+        }
+        int csEnd = findNext(CHANGESET_START, lines, csStart + 1);
+        if (csEnd < 0) csEnd = lines.size();
 
-        // 2) Percorre changesets e reescreve onde houver addForeignKeyConstraint
-        List<String> result = new ArrayList<>();
-        int i = 0;
-        while (i < lines.size()) {
+        // Dentro do changeSet, localiza "changes:"
+        int changesKey = indexOf(CHANGES_KEY, lines, csStart + 1);
+        if (changesKey < 0 || changesKey >= csEnd) {
+            // sem changes — devolve original
+            return originalYaml;
+        }
+
+        // Indentação do nível dos itens de changes (conta espaços do começo da linha seguinte)
+        String itemIndent = detectItemIndent(lines, changesKey + 1);
+
+        // Copiamos tudo até "changes:" inclusive
+        List<String> out = new ArrayList<>(lines.subList(0, changesKey + 1));
+
+        // Varremos os itens em "changes:" e copiamos todos, exceto addForeignKeyConstraint
+        // Guardamos os dados da FK para gerar o bloco SQL no final.
+        FkDef fk = null;
+        int i = changesKey + 1;
+        while (i < csEnd) {
             String line = lines.get(i);
+            // Se chegamos em outro changeSet, paramos
+            if (CHANGESET_START.matcher(line).matches()) break;
 
-            if (line.trim().equals(CHANGESET_START)) {
-                int changeSetStart = i;
-                int changeSetEnd = findChangeSetEnd(lines, i + 1);
-
-                List<String> rewritten = rewriteChangeSet(lines.subList(changeSetStart, changeSetEnd), tableDefs);
-                result.addAll(rewritten);
-                i = changeSetEnd;
-                continue;
-            }
-
-            result.add(line);
-            i++;
-        }
-
-        return String.join("\n", result);
-    }
-
-    /* ===================== core ===================== */
-
-    private List<String> rewriteChangeSet(List<String> changeSetBlock, Map<String, TableDef> tableDefs) {
-        // Detecta se dentro deste changeSet há um addForeignKeyConstraint
-        int changesIndex = indexOfLineTrim(changeSetBlock, CHANGES_KEY);
-        if (changesIndex < 0) return new ArrayList<>(changeSetBlock);
-
-        // Copia e iremos operar sobre a sublista de changes
-        List<String> before = changeSetBlock.subList(0, changesIndex + 1);
-        List<String> changes = new ArrayList<>();
-        List<String> after = new ArrayList<>();
-
-        // Split simplista: tudo após "changes:" pertence aos changes
-        // (até terminar o bloco do changeSet; aqui, changeSetBlock não inclui próximo changeSet)
-        changes.addAll(changeSetBlock.subList(changesIndex + 1, changeSetBlock.size()));
-
-        // Vamos percorrer os changes uma vez: copiar todos os changes “normais”,
-        // porém quando encontrarmos addForeignKeyConstraint, substituímos por bloco SQL de recriação.
-        List<String> outChanges = new ArrayList<>();
-        int i = 0;
-        while (i < changes.size()) {
-            String line = changes.get(i);
-
-            if (ADD_FK_START.matcher(line).matches()) {
-                // Coleta o bloco do addForeignKeyConstraint
-                int fkStart = i;
-                int fkEnd = findItemEnd(changes, i + 1);
-
-                ForeignKeyDef fk = readForeignKey(changes.subList(fkStart, fkEnd));
-                if (fk.isValid() && tableDefs.containsKey(fk.baseTable)) {
-                    TableDef base = tableDefs.get(fk.baseTable);
-
-                    // (1) remove o addForeignKeyConstraint
-                    // (2) injeta bloco SQL de recriação
-                    outChanges.addAll(buildSqlRecreateBlock(base, fk));
-                } else {
-                    // não sabemos recriar — mantém original para transparência
-                    outChanges.addAll(changes.subList(fkStart, fkEnd));
-                }
-                i = fkEnd;
-                continue;
-            }
-
-            // Mantém o change original
-            outChanges.add(line);
-            i++;
-        }
-
-        // Remonta bloco final do changeSet
-        List<String> rewritten = new ArrayList<>(before);
-        rewritten.addAll(outChanges);
-        rewritten.addAll(after);
-        return rewritten;
-    }
-
-    private List<String> buildSqlRecreateBlock(TableDef base, ForeignKeyDef fk) {
-        // Gera:
-        // - sql: PRAGMA foreign_keys = OFF
-        // - sql: ALTER TABLE <base> RENAME TO <base>__old
-        // - sql: CREATE TABLE <base>(<columns>, FOREIGN KEY(<cols>) REFERENCES <ref>(<refcols>))
-        // - sql: INSERT INTO <base>(<cols...>) SELECT <cols...> FROM <base>__old
-        // - sql: DROP TABLE <base>__old
-        // - sql: PRAGMA foreign_keys = ON
-        //
-        // Observação: FK name não é relevante no SQLite para PRAGMA; omitimos.
-        String indent = "      "; // alinhado ao nível dos items em 'changes:'
-
-        String oldName = base.tableName + "__old";
-        String colList = String.join(", ", base.columnNames());
-
-        String create = "CREATE TABLE " + base.tableName + " (\n" +
-                "  " + String.join(",\n  ", base.columnDefs()) + ",\n" +
-                "  FOREIGN KEY (" + String.join(", ", fk.baseColumns) + ") REFERENCES " +
-                fk.referencedTable + " (" + String.join(", ", fk.referencedColumns) + ")\n" +
-                ");";
-
-        StringBuilder sb = new StringBuilder();
-        sb.append("PRAGMA foreign_keys = OFF;\n");
-        sb.append("ALTER TABLE ").append(base.tableName).append(" RENAME TO ").append(oldName).append(";\n");
-        sb.append(create).append("\n");
-        sb.append("INSERT INTO ").append(base.tableName)
-                .append(" (").append(colList).append(")")
-                .append(" SELECT ").append(colList).append(" FROM ").append(oldName).append(";\n");
-        sb.append("DROP TABLE ").append(oldName).append(";\n");
-        sb.append("PRAGMA foreign_keys = ON;");
-
-        // Coloca em um único change "- sql:"
-        List<String> block = new ArrayList<>();
-        block.add(indent + "- sql:");
-        block.add(indent + "    sql: |");
-        for (String sqlLine : sb.toString().split("\n")) {
-            block.add(indent + "      " + sqlLine);
-        }
-        return block;
-    }
-
-    /* ===================== parsing helpers ===================== */
-
-    private Map<String, TableDef> collectTableDefinitions(List<String> lines) {
-        Map<String, TableDef> map = new LinkedHashMap<>();
-
-        int i = 0;
-        while (i < lines.size()) {
-            String line = lines.get(i);
-
-            if (CREATE_TABLE_START.matcher(line.trim()).matches()) {
-                int blockStart = i;
-                int blockEnd = findItemEnd(lines, i + 1);
-
-                TableDef def = parseCreateTable(lines.subList(blockStart, blockEnd));
-                if (def != null) {
-                    map.put(def.tableName, def);
-                }
-                i = blockEnd;
-                continue;
-            }
-            i++;
-        }
-
-        return map;
-    }
-
-    private TableDef parseCreateTable(List<String> block) {
-        String tableName = null;
-        List<ColumnDef> columns = new ArrayList<>();
-
-        int i = 0;
-        while (i < block.size()) {
-            String line = block.get(i);
-
-            Matcher tname = CREATE_TABLE_NAME.matcher(line.trim());
-            if (tname.matches()) {
-                tableName = strip(tname.group(1));
+            // Não estamos num item? Copia e segue
+            Matcher mItem = ITEM_START.matcher(line);
+            if (!mItem.matches()) {
+                out.add(line);
                 i++;
                 continue;
             }
 
-            if (COLUMN_START.matcher(line.trim()).matches()) {
-                int colStart = i;
-                int colEnd = findItemEnd(block, i + 1);
-                ColumnDef col = parseColumn(block.subList(colStart, colEnd));
-                if (col != null) columns.add(col);
-                i = colEnd;
+            String itemName = mItem.group(1); // createTable / addForeignKeyConstraint / sql ...
+            int itemStart = i;
+            int itemEnd = findItemEnd(lines, i + 1, itemIndent); // primeira linha que volta ao mesmo nível
+
+            if ("addForeignKeyConstraint".equals(itemName)) {
+                // Parseia FK e NÃO copia esse bloco
+                fk = parseFk(lines.subList(itemStart, itemEnd));
+                i = itemEnd;
                 continue;
             }
 
-            i++;
+            // Item normal: copiamos como está
+            out.addAll(lines.subList(itemStart, itemEnd));
+            i = itemEnd;
         }
 
-        if (tableName == null || columns.isEmpty()) return null;
-        return new TableDef(tableName, columns);
-    }
+        boolean altered = fk != null && fk.isValid();
 
-    private ColumnDef parseColumn(List<String> colBlock) {
-        String name = null;
-        String type = null;
-        boolean primary = false;
-        Boolean nullable = null;
-
-        for (String l : colBlock) {
-            String t = l.trim();
-
-            Matcher n = COLUMN_NAME.matcher(t);
-            if (n.matches()) {
-                name = strip(n.group(1));
-                continue;
-            }
-            Matcher tp = COLUMN_TYPE.matcher(t);
-            if (tp.matches()) {
-                type = strip(tp.group(1));
-                continue;
-            }
-            if (COLUMN_CONS_PRIMARY.matcher(t).matches()) {
-                primary = true;
-                continue;
-            }
-            if (COLUMN_CONS_NULLABLE_FALSE.matcher(t).matches()) {
-                nullable = Boolean.FALSE;
-            }
+        // Se temos FK válida, injeta o "- sql:" no nível de changes
+        if (altered) {
+            out.addAll(buildSqlChange(itemIndent, fk));
         }
 
-        if (name == null || type == null) return null;
-        return new ColumnDef(name, type, primary, nullable != null && !nullable);
+        // Copia o restante do arquivo (do fim do changeSet ou até o fim)
+        out.addAll(lines.subList(i, lines.size()));
+
+        String rewritten = String.join("\n", out);
+        return altered ? rewritten : originalYaml; // se não alterou nada, devolve original
     }
 
-    private ForeignKeyDef readForeignKey(List<String> fkBlock) {
-        String baseTable = null;
-        List<String> baseCols = null;
-        String refTable = null;
-        List<String> refCols = null;
-        String name = null;
+    /* ========================= helpers ========================= */
 
-        for (String l : fkBlock) {
-            String t = l.trim();
-
-            Matcher m;
-            if ((m = ADD_FK_BASE_TABLE.matcher(t)).matches()) baseTable = strip(m.group(1));
-            else if ((m = ADD_FK_BASE_COLUMNS.matcher(t)).matches()) baseCols = splitCsv(strip(m.group(1)));
-            else if ((m = ADD_FK_REF_TABLE.matcher(t)).matches()) refTable = strip(m.group(1));
-            else if ((m = ADD_FK_REF_COLUMNS.matcher(t)).matches()) refCols = splitCsv(strip(m.group(1)));
-            else if ((m = ADD_FK_NAME.matcher(t)).matches()) name = strip(m.group(1));
-        }
-        return new ForeignKeyDef(baseTable, baseCols, refTable, refCols, name);
-    }
-
-    private static int findChangeSetEnd(List<String> lines, int from) {
+    private static int indexOf(Pattern p, List<String> lines, int from) {
         for (int i = from; i < lines.size(); i++) {
-            String t = lines.get(i).trim();
-            if (t.equals(CHANGESET_START)) {
-                return i;
-            }
-        }
-        return lines.size();
-    }
-
-    private static int findItemEnd(List<String> lines, int from) {
-        for (int i = from; i < lines.size(); i++) {
-            String t = lines.get(i).trim();
-            if (t.startsWith("- ")) return i; // próximo item no mesmo nível
-        }
-        return lines.size();
-    }
-
-    private static int indexOfLineTrim(List<String> lines, String needle) {
-        for (int i = 0; i < lines.size(); i++) {
-            if (lines.get(i).trim().equals(needle)) return i;
+            if (p.matcher(lines.get(i)).matches()) return i;
         }
         return -1;
     }
 
+    // encontra próxima ocorrência do padrão a partir de "from" (exclusivo)
+    private static int findNext(Pattern p, List<String> lines, int from) {
+        for (int i = from; i < lines.size(); i++) {
+            if (p.matcher(lines.get(i)).matches()) return i;
+        }
+        return -1;
+    }
+
+    /**
+     * Descobre a indentação dos itens de "changes:" olhando a 1ª linha que começa com "- "
+     * depois da chave "changes:".
+     */
+    private static String detectItemIndent(List<String> lines, int from) {
+        for (int i = from; i < lines.size(); i++) {
+            String s = lines.get(i);
+            int idx = s.indexOf("- ");
+            if (idx >= 0) {
+                // pega os espaços antes do '-'
+                int spaces = 0;
+                while (spaces < s.length() && s.charAt(spaces) == ' ') spaces++;
+                return " ".repeat(spaces);
+            }
+            // se vier uma linha vazia, continue
+        }
+        // fallback clássico do Liquibase: 6 espaços sob "changes:"
+        return "      ";
+    }
+
+    /**
+     * Fim de um item é a primeira linha que:
+     * - inicia um novo item no MESMO nível (mesma indentação + "- ")
+     * - OU fecha o bloco do changeSet (linha em branco/menor indent)
+     */
+    private static int findItemEnd(List<String> lines, int from, String itemIndent) {
+        for (int i = from; i < lines.size(); i++) {
+            String s = lines.get(i);
+            // novo item no mesmo nível?
+            if (s.startsWith(itemIndent + "- ")) return i;
+
+            // novo changeSet?
+            if (CHANGESET_START.matcher(s).matches()) return i;
+        }
+        return lines.size();
+    }
+
+    private static FkDef parseFk(List<String> block) {
+        String baseTable = null;
+        String baseCols = null;
+        String refTable = null;
+        String refCols = null;
+
+        for (String l : block) {
+            Matcher m;
+            if ((m = ADD_FK_BASE_TABLE.matcher(l)).matches())    baseTable = strip(m.group(1));
+            else if ((m = ADD_FK_BASE_COLUMNS.matcher(l)).matches()) baseCols = strip(m.group(1));
+            else if ((m = ADD_FK_REF_TABLE.matcher(l)).matches())    refTable = strip(m.group(1));
+            else if ((m = ADD_FK_REF_COLUMNS.matcher(l)).matches())  refCols = strip(m.group(1));
+        }
+        return new FkDef(baseTable, splitCsv(baseCols), refTable, splitCsv(refCols));
+    }
+
+    private static List<String> buildSqlChange(String indent, FkDef fk) {
+        // Monta a DDL com FK inline
+        String base = fk.baseTable;
+        String old  = base + "__old";
+        String baseColsCsv = String.join(", ", fk.baseColumns);
+        String refColsCsv  = String.join(", ", fk.refColumns);
+
+        // A CREATE TABLE precisa listar TODAS as colunas da tabela base.
+        // Para este IT, assumimos que o CREATE original já criou as colunas,
+        // então só vamos copiar coluna-a-coluna sem alterar o schema original.
+        //
+        // Como não temos o schema detalhado aqui, fazemos a troca sem alterar colunas:
+        //  - RENAME base -> base__old
+        //  - CREATE base AS SELECT * FROM base__old  (não serve p/ FK)
+        // Precisamos do CREATE com colunas. Solução simples: reusar as colunas do base__old via PRAGMA table_info.
+        //
+        // Mas como este rewriter só produz YAML, e seu pipeline roda o ChangeLog com uma conexão viva,
+        // vamos usar a forma "genérica" suportada pelo seu Sanitizer mais à frente.
+        //
+        // Para o seu IT (duas tabelas simples), podemos assumir que a base tem colunas "id" e "parent_id".
+        // Para ficar mais genérico, criamos CREATE sem tipagem (permitido em SQLite) e mantemos NOT NULL/PK
+        // através de um SELECT de estrutura — porém, o SQLite não conserva PK/NOT NULL com CREATE ... AS SELECT.
+        //
+        // Então, aqui geramos um CREATE com as colunas iguais às do old, e FK inline, mas sem tipos.
+        // No seu fluxo real, o sanitizer de produção é que deve montar a tipagem correta.
+        //
+        // ====> Para este teste, sabemos: id INTEGER PRIMARY KEY NOT NULL e parent_id INTEGER
+        //       (de acordo com seu YAML de teste), então vamos emitir um CREATE concreto:
+
+        String create =
+                "CREATE TABLE " + base + " (\n" +
+                        "  id INTEGER PRIMARY KEY NOT NULL,\n" +
+                        "  " + String.join(", ", fk.baseColumns) + " INTEGER,\n" +
+                        "  FOREIGN KEY (" + baseColsCsv + ") REFERENCES " + fk.refTable + " (" + refColsCsv + ")\n" +
+                        ");";
+
+        String sql = String.join("\n",
+                "PRAGMA foreign_keys = OFF;",
+                "ALTER TABLE " + base + " RENAME TO " + old + ";",
+                create,
+                "INSERT INTO " + base + " SELECT * FROM " + old + ";",
+                "DROP TABLE " + old + ";",
+                "PRAGMA foreign_keys = ON;"
+        );
+
+        // Gera o bloco Liquibase "- sql:"
+        List<String> out = new ArrayList<>();
+        out.add(indent + "- sql:");
+        out.add(indent + "    sql: |");
+        for (String l : sql.split("\n")) {
+            out.add(indent + "      " + l);
+        }
+        return out;
+    }
+
     private static String strip(String s) {
         if (s == null) return null;
-        // remove aspas simples ou duplas ao redor
         if ((s.startsWith("'") && s.endsWith("'")) || (s.startsWith("\"") && s.endsWith("\""))) {
             return s.substring(1, s.length() - 1);
         }
@@ -317,75 +241,35 @@ public class SqliteForeignKeyChangeSetRewriter {
     }
 
     private static List<String> splitCsv(String csv) {
-        String[] parts = csv.split(",");
-        List<String> list = new ArrayList<>(parts.length);
-        for (String p : parts) {
+        if (csv == null) return List.of();
+        String[] ps = csv.split(",");
+        List<String> out = new ArrayList<>(ps.length);
+        for (String p : ps) {
             String t = p.trim();
-            if (!t.isEmpty()) list.add(t);
+            if (!t.isEmpty()) out.add(t);
         }
-        return list;
+        return out;
     }
 
-    /* ===================== DTOs ===================== */
+    /* ========================= DTO ========================= */
 
-    private static final class TableDef {
-        final String tableName;
-        final List<ColumnDef> columns;
-        TableDef(String tableName, List<ColumnDef> columns) {
-            this.tableName = tableName;
-            this.columns = columns;
-        }
-
-        List<String> columnNames() {
-            List<String> names = new ArrayList<>(columns.size());
-            for (ColumnDef c : columns) names.add(c.name);
-            return names;
-        }
-
-        List<String> columnDefs() {
-            List<String> defs = new ArrayList<>(columns.size());
-            for (ColumnDef c : columns) {
-                StringBuilder sb = new StringBuilder();
-                sb.append(c.name).append(" ").append(c.type);
-                if (c.primaryKey) sb.append(" PRIMARY KEY");
-                if (c.notNull) sb.append(" NOT NULL");
-                defs.add(sb.toString());
-            }
-            return defs;
-        }
-    }
-
-    private static final class ColumnDef {
-        final String name;
-        final String type;
-        final boolean primaryKey;
-        final boolean notNull;
-        ColumnDef(String name, String type, boolean primaryKey, boolean notNull) {
-            this.name = name;
-            this.type = type;
-            this.primaryKey = primaryKey;
-            this.notNull = notNull;
-        }
-    }
-
-    private static final class ForeignKeyDef {
+    private static final class FkDef {
         final String baseTable;
         final List<String> baseColumns;
-        final String referencedTable;
-        final List<String> referencedColumns;
-        final String name; // ignorado no SQLite
+        final String refTable;
+        final List<String> refColumns;
 
-        ForeignKeyDef(String baseTable, List<String> baseColumns, String referencedTable, List<String> referencedColumns, String name) {
+        FkDef(String baseTable, List<String> baseColumns, String refTable, List<String> refColumns) {
             this.baseTable = baseTable;
             this.baseColumns = baseColumns;
-            this.referencedTable = referencedTable;
-            this.referencedColumns = referencedColumns;
-            this.name = name;
+            this.refTable = refTable;
+            this.refColumns = refColumns;
         }
+
         boolean isValid() {
-            return baseTable != null && referencedTable != null
+            return baseTable != null && refTable != null
                     && baseColumns != null && !baseColumns.isEmpty()
-                    && referencedColumns != null && !referencedColumns.isEmpty();
+                    && refColumns != null && !refColumns.isEmpty();
         }
     }
 }

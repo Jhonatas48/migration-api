@@ -1,8 +1,12 @@
 package com.github.jhonatas48.migrationapi.core;
 
 import com.github.jhonatas48.migrationapi.core.audit.MigrationAuditService;
-import liquibase.Scope;
-import liquibase.command.CommandScope;
+import liquibase.Contexts;
+import liquibase.LabelExpression;
+import liquibase.Liquibase;
+import liquibase.database.Database;
+import liquibase.database.DatabaseFactory;
+import liquibase.database.jvm.JdbcConnection;
 import liquibase.resource.ClassLoaderResourceAccessor;
 import liquibase.resource.CompositeResourceAccessor;
 import liquibase.resource.DirectoryResourceAccessor;
@@ -13,8 +17,8 @@ import org.slf4j.LoggerFactory;
 import javax.sql.DataSource;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
-import java.util.Map;
-import java.util.Objects;
+import java.sql.Connection;
+import java.sql.Statement;
 
 public class ChangeLogApplier {
 
@@ -29,13 +33,18 @@ public class ChangeLogApplier {
         this.dataSource = dataSource;
     }
 
+    /**
+     * Aplica um changelog YAML (caminho absoluto). O YAML é sanitizado para SQLite
+     * (rebuilds/FKs inline), opcionalmente gravado como "-sqlite.yaml" e então aplicado
+     * via API Java do Liquibase usando a Connection do DataSource (sem CommandScope e sem 'url').
+     */
     public void applyChangeLog(String changeLogAbsolutePath) throws Exception {
         Path path = Paths.get(changeLogAbsolutePath).toAbsolutePath().normalize();
         if (!Files.exists(path)) {
             throw new NoSuchFileException("Arquivo não encontrado: " + path);
         }
 
-        // Carrega YAML original
+        // Lê YAML original
         String originalYaml = Files.readString(path, StandardCharsets.UTF_8);
 
         // 1) Sanitiza para SQLite: remove changes de FK e aplica rebuilds
@@ -45,33 +54,42 @@ public class ChangeLogApplier {
         SqliteForeignKeySanitizer.SanitizationResult result = sqliteSanitizer.sanitizeAndApplyRebuilds(originalYaml);
         String yamlToApply = result.getYamlForLiquibase();
 
-        // Se alterou, escreve um arquivo "-sqlite" ao lado, para histórico e leitura pelo Liquibase
+        // Se alterou, grava um "-sqlite.yaml" ao lado e vamos aplicar esse
         Path toApplyPath = path;
         if (result.wasAltered()) {
-            Path sqlitePath = path.getParent().resolve(path.getFileName().toString().replace(".yaml", "-sqlite.yaml"));
-            Files.writeString(sqlitePath, yamlToApply, StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            Path sqlitePath = path.getParent().resolve(
+                    path.getFileName().toString().replaceFirst("\\.ya?ml$", "") + "-sqlite.yaml"
+            );
+            Files.writeString(sqlitePath, yamlToApply, StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
             LOGGER.info("YAML ajustado para SQLite gravado em {}", sqlitePath);
             toApplyPath = sqlitePath;
         }
 
-        // 2) Rodar Liquibase com o arquivo final
+        // 2) Executa via API Java do Liquibase (sem CommandScope e sem 'url')
         System.setProperty(LIQUIBASE_PLUGIN_PACKAGES_PROP, HIBERNATE_PLUGIN_PACKAGE);
 
-        CommandScope update = new CommandScope("update");
-        update.addArgumentValue("changelogFile", toApplyPath.getFileName().toString());
-
+        // Acessor que enxerga o diretório do changelog e o classpath (para includes)
         ClassLoader cl = Thread.currentThread().getContextClassLoader();
         ResourceAccessor classpathAccessor = new ClassLoaderResourceAccessor(cl);
         ResourceAccessor directoryAccessor = new DirectoryResourceAccessor(toApplyPath.getParent());
         ResourceAccessor compositeAccessor = new CompositeResourceAccessor(directoryAccessor, classpathAccessor);
 
-        Map<String, Object> scope = Map.of(
-                Scope.Attr.resourceAccessor.name(), compositeAccessor,
-                Scope.Attr.classLoader.name(), cl,
-                LIQUIBASE_PLUGIN_PACKAGES_PROP, HIBERNATE_PLUGIN_PACKAGE
-        );
+        // Importante: o Liquibase vai procurar o arquivo pelo nome relativo ao 'directoryAccessor'
+        String changeLogRelative = toApplyPath.getFileName().toString();
 
-        Scope.child(scope, () -> { update.execute(); return null; });
+        try (Connection conn = dataSource.getConnection()) {
+            // Em SQLite, garanta FK enforcement nesta conexão usada pelo Liquibase
+            try (Statement st = conn.createStatement()) {
+                st.execute("PRAGMA foreign_keys = ON");
+            }
+
+            Database database = DatabaseFactory.getInstance()
+                    .findCorrectDatabaseImplementation(new JdbcConnection(conn));
+
+            Liquibase liquibase = new Liquibase(changeLogRelative, compositeAccessor, database);
+            liquibase.update(new Contexts(), new LabelExpression());
+        }
 
         LOGGER.info("ChangeLog aplicado: {}", toApplyPath);
     }
