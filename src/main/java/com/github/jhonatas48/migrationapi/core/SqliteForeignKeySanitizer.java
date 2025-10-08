@@ -100,8 +100,7 @@ public class SqliteForeignKeySanitizer {
                 op.getReferencedTable(),
                 op.getReferencedColumnsCsv(),
                 onDelete,
-                onUpdate,
-                match
+                onUpdate
         );
     }
 

@@ -15,10 +15,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.sql.DataSource;
-import java.io.BufferedReader;
-import java.io.BufferedWriter;
-import java.io.FileNotFoundException;
-import java.io.IOException;
+import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -29,26 +26,17 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Aplica changelogs com pré-processamento para compatibilidade com SQLite:
- *  - Converte addUniqueConstraint -> createIndex(unique: true)
- *  - Remove modifyDataType (SQLite não suporta) e registra pendências
- *
- * Em seguida, aplica o changelog via API direta do Liquibase, detectando
- * automaticamente se o arquivo está no filesystem (ex.: /tmp) ou no classpath.
+ * Aplica um changelog YAML ao SQLite, garantindo pré-processamento de compatibilidade.
+ * - Se o YAML estiver no filesystem: ajusta (se necessário) e aplica.
+ * - Se o YAML estiver no classpath: carrega, ajusta e materializa um arquivo *ajustado* em target/,
+ *   então aplica a partir desse arquivo.
  */
 public final class ChangeLogApplier {
 
-    private static final Logger LOGGER = LoggerFactory.getLogger(ChangeLogApplier.class);
+    private static final Logger LOG = LoggerFactory.getLogger(ChangeLogApplier.class);
 
+    private static final String GENERATED_DIR = "target/generated-changelogs";
     private static final String SQLITE_SUFFIX = "-sqlite.yaml";
-
-    // Padrões para varrer YAML gerado
-    private static final Pattern ADD_UNIQUE_CONSTRAINT_START =
-            Pattern.compile("^\\s*-\\s*addUniqueConstraint\\s*:\\s*$");
-    private static final Pattern MODIFY_DATA_TYPE_START =
-            Pattern.compile("^\\s*-\\s*modifyDataType\\s*:\\s*$");
-    private static final Pattern YAML_KEY_VALUE =
-            Pattern.compile("^\\s*([a-zA-Z_][a-zA-Z0-9_]*)\\s*:\\s*(.+?)\\s*$");
 
     private final DataSource dataSource;
 
@@ -56,301 +44,555 @@ public final class ChangeLogApplier {
         this.dataSource = Objects.requireNonNull(dataSource, "dataSource must not be null");
     }
 
-    /**
-     * Ajusta o changelog para SQLite e aplica via Liquibase.
-     * @param originalChangeLogPath caminho do changelog original (YAML). Pode ser
-     *                              absoluto em disco (ex.: %TEMP%) ou um recurso do classpath.
-     */
-    public void applyChangeLog(final String originalChangeLogPath) {
-        Objects.requireNonNull(originalChangeLogPath, "originalChangeLogPath must not be null");
+    /** Aplica o changelog ao banco. Aceita caminho de filesystem ou classpath. */
+    public void applyChangeLog(final String originalPathOrClasspath) {
+        Objects.requireNonNull(originalPathOrClasspath, "originalPathOrClasspath must not be null");
+        try (Connection jdbc = dataSource.getConnection()) {
+            final Database liquibaseDb = DatabaseFactory.getInstance()
+                    .findCorrectDatabaseImplementation(new JdbcConnection(jdbc));
 
-        try {
-            final Path originalPath = Path.of(originalChangeLogPath);
-            Path pathParaAplicar;
+            final ChangelogMaterialization mat = materializeAdjustedChangelog(originalPathOrClasspath);
+            final ResourceAccessor accessor = buildAccessor(mat.baseDirectory);
 
-            // Pré-processa apenas se o arquivo existir no filesystem.
-            if (Files.exists(originalPath)) {
-                final Path adjustedPath = buildSqliteAdjustedPath(originalPath);
-                final SqliteAdjustmentResult result = adjustChangelogForSqlite(originalPath, adjustedPath);
+            LOG.info("Aplicando changelog ajustado: {}", mat.logicalFileName);
+            final Liquibase lb = new Liquibase(mat.logicalFileName, accessor, liquibaseDb);
+            lb.update((Contexts) null, (LabelExpression) null);
 
-                if (result.modified) {
-                    pathParaAplicar = adjustedPath;
-                    LOGGER.info("YAML ajustado para SQLite gravado em {}", adjustedPath);
-                    logPendingTypeChanges(result.pendingTypeChanges);
-                } else {
-                    pathParaAplicar = originalPath;
-                    LOGGER.info("Changelog já compatível com SQLite. Usando arquivo original: {}", originalPath);
-                }
-            } else {
-                // Caso de classpath: não há pré-processamento em disco aqui;
-                // se precisar, o gerador pode ser ajustado para depositar em /generated antes.
-                LOGGER.info("Changelog não encontrado no filesystem. Tentando no classpath: {}", originalChangeLogPath);
-                pathParaAplicar = Path.of(originalChangeLogPath); // apenas para logging/coerência
-            }
-
-            applyWithLiquibase(pathParaAplicar, originalChangeLogPath);
-
-        } catch (IOException e) {
-            throw new IllegalStateException("Falha ao ajustar o changelog para SQLite: " + e.getMessage(), e);
-        } catch (LiquibaseException | SQLException e) {
+        } catch (SQLException | LiquibaseException e) {
             throw new IllegalStateException("Falha ao aplicar o changelog ajustado: " + e.getMessage(), e);
         }
     }
 
-    // ========================================================================
-    // Liquibase Runner — resolve classpath x filesystem
-    // ========================================================================
+    // ===== Materialização do YAML ajustado =====
 
-    /**
-     * Aplica o changelog usando o accessor correto:
-     * - Se o arquivo existir no filesystem, usamos DirectoryResourceAccessor apontando para o diretório do arquivo.
-     * - Também combinamos com ClassLoaderResourceAccessor (fallback para dependências referenciadas).
-     * - Se não existir no filesystem, tentamos apenas via classpath.
-     */
-    private void applyWithLiquibase(final Path pathParaAplicar, final String logicalOriginalArg)
-            throws SQLException, LiquibaseException {
+    private ChangelogMaterialization materializeAdjustedChangelog(final String input) {
+        final Path fsPath = Path.of(input);
+        if (Files.exists(fsPath)) {
+            final List<String> original = readAllLines(fsPath);
+            final SqliteChangeLogAdjuster.AdjustResult result = SqliteChangeLogAdjuster.adjustToSqlite(original);
+            final Path outDir = fsPath.getParent() != null ? fsPath.getParent() : Path.of(".");
+            final Path outFile = outDir.resolve(sqliteName(fsPath.getFileName().toString()));
+            final Path adjustedPath = SqliteChangeLogAdjuster.writeAdjustedFile(outFile, result.adjustedLines);
 
-        try (Connection jdbcConnection = dataSource.getConnection()) {
-            final Database database = DatabaseFactory.getInstance()
-                    .findCorrectDatabaseImplementation(new JdbcConnection(jdbcConnection));
+            logAdjustSummary(result);
+            return new ChangelogMaterialization(outDir.toAbsolutePath(), adjustedPath.getFileName().toString());
+        }
 
-            final boolean existsOnFs = Files.exists(pathParaAplicar);
-            final ResourceAccessor resourceAccessor;
-            final String changelogLogicalPath;
+        final Optional<List<String>> inClasspath = readClasspathLines(input);
+        final List<String> originalLines = inClasspath.orElseThrow(() ->
+                new IllegalStateException("Recurso não encontrado no classpath: " + input + ". Coloque em src/test/resources."));
+        final SqliteChangeLogAdjuster.AdjustResult result = SqliteChangeLogAdjuster.adjustToSqlite(originalLines);
 
-            if (existsOnFs) {
-                final Path parent = Optional.ofNullable(pathParaAplicar.getParent()).orElse(Path.of(".")).toAbsolutePath();
-                resourceAccessor = new CompositeResourceAccessor(
-                        new DirectoryResourceAccessor(parent.toFile()),
-                        new ClassLoaderResourceAccessor(Thread.currentThread().getContextClassLoader())
-                );
-                changelogLogicalPath = pathParaAplicar.getFileName().toString();
-                LOGGER.debug("Aplicando changelog pelo filesystem. root={}, file={}", parent, changelogLogicalPath);
-            } else {
-                // Apenas classpath. Aqui usamos a string original passada pelo chamador,
-                // que deve corresponder ao path do recurso no classpath.
-                resourceAccessor = new ClassLoaderResourceAccessor(Thread.currentThread().getContextClassLoader());
-                changelogLogicalPath = logicalOriginalArg;
-                LOGGER.debug("Aplicando changelog pelo classpath. resource={}", changelogLogicalPath);
+        final Path outDir = Path.of(GENERATED_DIR);
+        final String adjustedName = sqliteName(Path.of(input).getFileName().toString());
+        final Path outFile = outDir.resolve(adjustedName);
+        final Path adjustedPath = SqliteChangeLogAdjuster.writeAdjustedFile(outFile, result.adjustedLines);
+
+        logAdjustSummary(result);
+        return new ChangelogMaterialization(outDir.toAbsolutePath(), adjustedPath.getFileName().toString());
+    }
+
+    private static void logAdjustSummary(SqliteChangeLogAdjuster.AdjustResult result) {
+        if (!result.modified) {
+            LOG.info("Changelog já compatível com SQLite (nenhum ajuste necessário).");
+            return;
+        }
+        LOG.info("Changelog ajustado para SQLite.");
+        if (!result.removedForeignKeyBlocks.isEmpty()) {
+            LOG.warn("Blocos FK removidos: {}", result.removedForeignKeyBlocks.size());
+        }
+        if (!result.pendingTypeChanges.isEmpty()) {
+            LOG.warn("modifyDataType removidos (pendências={}):", result.pendingTypeChanges.size());
+            result.pendingTypeChanges.forEach(p ->
+                    LOG.warn(" - table='{}', column='{}', newType='{}'", p.tableName, p.columnName, p.newDataType));
+        }
+    }
+
+    private static List<String> readAllLines(Path path) {
+        try {
+            return Files.readAllLines(path, StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new UncheckedIOException("Falha ao ler " + path, e);
+        }
+    }
+
+    private static Optional<List<String>> readClasspathLines(String resourcePath) {
+        final ClassLoader cl = Thread.currentThread().getContextClassLoader();
+        try (var in = cl.getResourceAsStream(resourcePath)) {
+            if (in == null) return Optional.empty();
+            try (var br = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
+                return Optional.of(br.lines().toList());
             }
+        } catch (IOException e) {
+            throw new UncheckedIOException("Falha ao ler do classpath: " + resourcePath, e);
+        }
+    }
 
-            final Liquibase liquibase = new Liquibase(changelogLogicalPath, resourceAccessor, database);
-            liquibase.update((Contexts) null, (LabelExpression) null);
+    private static ResourceAccessor buildAccessor(Path baseDir) {
+        try {
+            return new CompositeResourceAccessor(
+                    new DirectoryResourceAccessor(baseDir.toFile()),
+                    new ClassLoaderResourceAccessor(Thread.currentThread().getContextClassLoader())
+            );
         } catch (FileNotFoundException e) {
             throw new RuntimeException(e);
         }
     }
 
-    // ========================================================================
-    // Ajuste do YAML para SQLite
-    // ========================================================================
+    private static String sqliteName(String originalFileName) {
+        return originalFileName.endsWith(".yaml")
+                ? originalFileName.replace(".yaml", SQLITE_SUFFIX)
+                : originalFileName + SQLITE_SUFFIX;
+    }
 
-    private SqliteAdjustmentResult adjustChangelogForSqlite(final Path sourceYaml, final Path targetYaml) throws IOException {
-        final List<String> adjustedLines = new ArrayList<>();
-        final List<PendingTypeChange> pendingTypeChanges = new ArrayList<>();
+    // ===== DTO interno =====
+    private record ChangelogMaterialization(Path baseDirectory, String logicalFileName) { }
 
-        try (BufferedReader reader = Files.newBufferedReader(sourceYaml, StandardCharsets.UTF_8)) {
-            String line;
-            boolean insideAddUnique = false;
-            boolean insideModifyType = false;
+    /**
+     * Torna um changelog Liquibase mais compatível com SQLite.
+     * - remove addForeignKeyConstraint/dropForeignKeyConstraint
+     * - remove modifyDataType (e loga pendências)
+     * - converte addUniqueConstraint -> createIndex(unique: true)
+     * - injeta preConditions quando o changeset altera tabela potencialmente inexistente
+     */
+    static final class SqliteChangeLogAdjuster {
 
-            Map<String, String> addUniqueBlock = new LinkedHashMap<>();
-            Map<String, String> modifyTypeBlock = new LinkedHashMap<>();
-            int blockIndent = 0;
+        private static final Pattern START_CHANGESET       = Pattern.compile("^\\s*-\\s*changeSet\\s*:\\s*$");
+        private static final Pattern START_ADD_UNIQUE      = Pattern.compile("^\\s*-\\s*addUniqueConstraint\\s*:\\s*$");
+        private static final Pattern START_MODIFY_TYPE     = Pattern.compile("^\\s*-\\s*modifyDataType\\s*:\\s*$");
+        private static final Pattern START_ADD_FK          = Pattern.compile("^\\s*-\\s*addForeignKeyConstraint\\s*:\\s*$");
+        private static final Pattern START_DROP_FK         = Pattern.compile("^\\s*-\\s*dropForeignKeyConstraint\\s*:\\s*$");
+        private static final Pattern YAML_KEY_VALUE        = Pattern.compile("^\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*:\\s*(.*?)\\s*$");
+        private static final Pattern START_GENERIC_CHANGE  = Pattern.compile("^\\s*-\\s*([A-Za-z][A-Za-z0-9_]*)\\s*:\\s*$");
 
-            while ((line = reader.readLine()) != null) {
-                if (ADD_UNIQUE_CONSTRAINT_START.matcher(line).find()) {
-                    insideAddUnique = true;
-                    addUniqueBlock.clear();
-                    blockIndent = leadingSpaces(line);
+        // ⚠️ não pule mais createIndex — precisamos de preconditions pra evitar erro no SQLite
+        private static final Set<String> CHANGE_TYPES_SKIP_PRECOND = Set.of(
+                "createTable", "addUniqueConstraint"
+        );
+
+        private static final List<String> TABLE_NAME_KEYS = List.of(
+                "tableName", "baseTableName", "oldTableName"
+        );
+
+        static AdjustResult adjustToSqlite(final List<String> originalLines) {
+            Objects.requireNonNull(originalLines, "originalLines must not be null");
+
+            final List<String> output = new ArrayList<>(originalLines.size());
+            final List<PendingTypeChange> pendingTypeChanges = new ArrayList<>();
+            final List<RemovedForeignKeyBlock> removedForeignKeyBlocks = new ArrayList<>();
+            boolean modified = false;
+
+            for (int i = 0; i < originalLines.size(); i++) {
+                final String line = originalLines.get(i);
+
+                if (isStart(line, START_CHANGESET)) {
+                    final int baseIndent = indentOf(line);
+                    final int endIdx = findBlockEnd(originalLines, baseIndent, i);
+                    final List<String> csBlock = originalLines.subList(i, endIdx + 1);
+
+                    final List<String> adjustedChangeSet =
+                            adjustSingleChangeSetBlock(csBlock, pendingTypeChanges, removedForeignKeyBlocks);
+
+                    output.addAll(adjustedChangeSet);
+                    modified = true;
+                    i = endIdx;
                     continue;
                 }
-                if (MODIFY_DATA_TYPE_START.matcher(line).find()) {
-                    insideModifyType = true;
-                    modifyTypeBlock.clear();
-                    blockIndent = leadingSpaces(line);
+
+                if (isStart(line, START_ADD_FK) || isStart(line, START_DROP_FK)) {
+                    final boolean isAdd = isStart(line, START_ADD_FK);
+                    final int baseIndent = indentOf(line);
+                    final Map<String, String> fields = readBlockFields(originalLines, baseIndent, i + 1);
+
+                    removedForeignKeyBlocks.add(isAdd
+                            ? RemovedForeignKeyBlock.add(fields)
+                            : RemovedForeignKeyBlock.drop(fields));
+
+                    modified = true;
+                    i = skipBlock(originalLines, baseIndent, i);
                     continue;
                 }
 
-                if (insideAddUnique) {
-                    if (leadingSpaces(line) > blockIndent && YAML_KEY_VALUE.matcher(line).find()) {
-                        final Matcher m = YAML_KEY_VALUE.matcher(line);
-                        if (m.find()) addUniqueBlock.put(m.group(1).trim(), stripYamlScalar(m.group(2)));
-                        continue;
-                    } else {
-                        adjustedLines.addAll(renderCreateUniqueIndexBlock(blockIndent, addUniqueBlock));
-                        insideAddUnique = false;
-                        addUniqueBlock.clear();
-                        // cai para processamento normal da linha atual
+                if (isStart(line, START_ADD_UNIQUE)) {
+                    final int baseIndent = indentOf(line);
+                    final Map<String, String> fields = readBlockFields(originalLines, baseIndent, i + 1);
+
+                    output.addAll(renderCreateUniqueIndexBlock(baseIndent, fields));
+                    modified = true;
+                    i = skipBlock(originalLines, baseIndent, i);
+                    continue;
+                }
+
+                if (isStart(line, START_MODIFY_TYPE)) {
+                    final int baseIndent = indentOf(line);
+                    final Map<String, String> fields = readBlockFields(originalLines, baseIndent, i + 1);
+
+                    toPendingTypeChange(fields).ifPresent(pendingTypeChanges::add);
+                    modified = true;
+                    i = skipBlock(originalLines, baseIndent, i);
+                    continue;
+                }
+
+                output.add(line);
+            }
+
+            return new AdjustResult(modified, output, pendingTypeChanges, removedForeignKeyBlocks);
+        }
+
+        private static List<String> adjustSingleChangeSetBlock(
+                List<String> changeSetLines,
+                List<PendingTypeChange> pendingTypeChanges,
+                List<RemovedForeignKeyBlock> removedForeignKeyBlocks
+        ) {
+            final int baseIndent = indentOf(changeSetLines.get(0));
+            final List<String> rewritten = new ArrayList<>(changeSetLines.size());
+
+            // "- changeSet:"
+            rewritten.add(changeSetLines.get(0));
+
+            // Metadados (id, author, labels etc.)
+            int cursor = 1;
+            while (cursor < changeSetLines.size() && isMetadataLine(changeSetLines.get(cursor), baseIndent)) {
+                rewritten.add(changeSetLines.get(cursor));
+                cursor++;
+            }
+
+            // Localiza "changes:"
+            final int changesIdx = findChangesLineIndex(changeSetLines, baseIndent, cursor);
+            final boolean hasChangesSection = changesIdx >= 0;
+
+            if (!hasChangesSection) {
+                while (cursor < changeSetLines.size()) {
+                    rewritten.add(changeSetLines.get(cursor++));
+                }
+                return rewritten;
+            }
+
+            // Copia tudo até "changes:"
+            while (cursor < changesIdx) rewritten.add(changeSetLines.get(cursor++));
+
+            final int changesIndent = indentOf(changeSetLines.get(changesIdx));
+            final List<List<String>> changeBlocks = readChangeBlocks(changeSetLines, changesIdx, changesIndent);
+
+            final ChangeSetAnalysis analysis = analyzeChangeBlocks(changeBlocks, pendingTypeChanges, removedForeignKeyBlocks);
+
+            // Injeta preconditions **irmão de "changes:"** se fizer sentido
+            if (analysis.shouldInjectPreconditions() && analysis.tableForPrecondition != null && !analysis.tableForPrecondition.isBlank()) {
+                rewritten.addAll(renderPreconditionsBlock(changesIndent, analysis.tableForPrecondition));
+            }
+
+            // Agora "changes:" e os blocos reescritos
+            rewritten.add(changeSetLines.get(changesIdx)); // "changes:"
+            rewritten.addAll(analysis.rewrittenBlocks);
+
+            return rewritten;
+        }
+
+        private static boolean isMetadataLine(String line, int changeSetBaseIndent) {
+            final int lineIndent = indentOf(line);
+            if (lineIndent <= changeSetBaseIndent) return false;
+            return !line.trim().startsWith("changes:");
+        }
+
+        private static int findChangesLineIndex(List<String> lines, int baseIndent, int start) {
+            for (int i = start; i < lines.size(); i++) {
+                final String trimmed = lines.get(i).trim();
+                if (indentOf(lines.get(i)) > baseIndent && "changes:".equals(trimmed)) {
+                    return i;
+                }
+            }
+            return -1;
+        }
+
+        private static List<List<String>> readChangeBlocks(List<String> lines, int changesIdx, int changesIndent) {
+            final List<List<String>> blocks = new ArrayList<>();
+            int i = changesIdx + 1;
+            while (i < lines.size()) {
+                final String current = lines.get(i);
+                final int ind = indentOf(current);
+                if (ind <= changesIndent) break;
+
+                if (isStart(current, START_GENERIC_CHANGE)) {
+                    final int base = indentOf(current);
+                    final int end = findBlockEnd(lines, base, i);
+                    blocks.add(new ArrayList<>(lines.subList(i, end + 1)));
+                    i = end + 1;
+                    continue;
+                }
+
+                blocks.add(List.of(current));
+                i++;
+            }
+            return blocks;
+        }
+
+        private static ChangeSetAnalysis analyzeChangeBlocks(
+                List<List<String>> rawBlocks,
+                List<PendingTypeChange> pendingTypeChanges,
+                List<RemovedForeignKeyBlock> removedForeignKeyBlocks
+        ) {
+            final List<String> rewritten = new ArrayList<>();
+            final Set<String> tablesMentionedForPrecond = new LinkedHashSet<>();
+            boolean hasCreateTableForAny = false;
+
+            for (List<String> block : rawBlocks) {
+                if (block.isEmpty()) continue;
+
+                final String first = block.get(0);
+                final int baseIndent = indentOf(first);
+
+                if (isStart(first, START_ADD_FK) || isStart(first, START_DROP_FK)) {
+                    final boolean isAdd = isStart(first, START_ADD_FK);
+                    final Map<String, String> fields = readBlockFields(block, baseIndent, 1);
+                    removedForeignKeyBlocks.add(isAdd
+                            ? RemovedForeignKeyBlock.add(fields)
+                            : RemovedForeignKeyBlock.drop(fields));
+                    continue;
+                }
+
+                if (isStart(first, START_ADD_UNIQUE)) {
+                    final Map<String, String> fields = readBlockFields(block, baseIndent, 1);
+                    rewritten.addAll(renderCreateUniqueIndexBlock(baseIndent, fields));
+                    continue;
+                }
+
+                if (isStart(first, START_MODIFY_TYPE)) {
+                    final Map<String, String> fields = readBlockFields(block, baseIndent, 1);
+                    toPendingTypeChange(fields).ifPresent(pendingTypeChanges::add);
+                    continue;
+                }
+
+                // mantém bloco original
+                rewritten.addAll(block);
+
+                final String changeType = extractChangeType(first).orElse("");
+
+                if ("createTable".equals(changeType)) {
+                    hasCreateTableForAny = true;
+                }
+
+                // coletar possíveis nomes de tabela para o precondition
+                if (!CHANGE_TYPES_SKIP_PRECOND.contains(changeType)) {
+                    final Map<String, String> fields = readBlockFields(block, baseIndent, 1);
+                    resolveTableNameForPrecond(fields).ifPresent(tablesMentionedForPrecond::add);
+                }
+            }
+
+            final String tableForPrecondition = pickSingleTable(tablesMentionedForPrecond);
+            final boolean shouldInjectPreconditions =
+                    tableForPrecondition != null && !hasCreateTableForAny;
+
+            return new ChangeSetAnalysis(rewritten, shouldInjectPreconditions, tableForPrecondition);
+        }
+
+        private static Optional<String> resolveTableNameForPrecond(Map<String, String> fields) {
+            for (String key : TABLE_NAME_KEYS) {
+                final String v = fields.get(key);
+                if (!isBlank(v)) return Optional.of(v);
+            }
+            return Optional.empty();
+        }
+
+        private static String pickSingleTable(Set<String> tables) {
+            if (tables.isEmpty()) return null;
+            if (tables.size() == 1) return tables.iterator().next();
+            return null; // mais de uma tabela: não injeta para evitar "null"
+        }
+
+        private static Optional<String> extractChangeType(String firstLine) {
+            final Matcher m = START_GENERIC_CHANGE.matcher(firstLine);
+            if (!m.find()) return Optional.empty();
+            return Optional.ofNullable(m.group(1));
+        }
+
+        /** Renderiza preConditions como irmão de "changes:" */
+        private static List<String> renderPreconditionsBlock(int indent, String tableName) {
+            final String pad  = " ".repeat(indent);       // preConditions:
+            final String pad2 = " ".repeat(indent + 2);   // onFail/onError/and:
+            final String pad4 = " ".repeat(indent + 4);   // - tableExists:
+            final String pad6 = " ".repeat(indent + 6);   // tableName:
+
+            List<String> out = new ArrayList<>();
+            out.add(pad  + "preConditions:");
+            out.add(pad2 + "onFail: MARK_RAN");
+            out.add(pad2 + "onError: MARK_RAN");
+            out.add(pad2 + "and:");
+            out.add(pad4 + "- tableExists:");
+            out.add(pad6 + "tableName: '" + tableName + "'");
+            return out;
+        }
+
+        // ---------- Escrita segura do arquivo ajustado ----------
+        static Path writeAdjustedFile(final Path targetFile, final List<String> adjustedLines) {
+            Objects.requireNonNull(targetFile, "targetFile must not be null");
+            Objects.requireNonNull(adjustedLines, "adjustedLines must not be null");
+
+            try {
+                final Path parent = targetFile.getParent();
+                if (parent != null) Files.createDirectories(parent);
+
+                try (BufferedWriter writer = Files.newBufferedWriter(targetFile, StandardCharsets.UTF_8)) {
+                    for (String line : adjustedLines) {
+                        writer.write(line);
+                        writer.newLine();
                     }
                 }
+                return targetFile;
+            } catch (IOException e) {
+                throw new UncheckedIOException("Falha ao gravar YAML ajustado em " + targetFile, e);
+            }
+        }
 
-                if (insideModifyType) {
-                    if (leadingSpaces(line) > blockIndent && YAML_KEY_VALUE.matcher(line).find()) {
-                        final Matcher m = YAML_KEY_VALUE.matcher(line);
-                        if (m.find()) modifyTypeBlock.put(m.group(1).trim(), stripYamlScalar(m.group(2)));
-                        continue;
-                    } else {
-                        final PendingTypeChange pending = toPendingTypeChange(modifyTypeBlock);
-                        if (pending != null) pendingTypeChanges.add(pending);
-                        insideModifyType = false;
-                        modifyTypeBlock.clear();
-                        // cai para processamento normal da linha atual
-                    }
+        // ---------- Utilidades de parsing ----------
+        private static boolean isStart(String line, Pattern p) {
+            return p.matcher(line).find();
+        }
+
+        private static int indentOf(String s) {
+            int i = 0;
+            while (i < s.length() && s.charAt(i) == ' ') i++;
+            return i;
+        }
+
+        private static String stripQuotes(String raw) {
+            if (raw == null) return "";
+            final String t = raw.trim();
+            if ((t.startsWith("'") && t.endsWith("'")) || (t.startsWith("\"") && t.endsWith("\""))) {
+                return t.substring(1, t.length() - 1);
+            }
+            return t;
+        }
+
+        private static Map<String, String> readBlockFields(List<String> lines, int baseIndent, int startIdx) {
+            final Map<String, String> fields = new LinkedHashMap<>();
+            int j = startIdx;
+            while (j < lines.size() && indentOf(lines.get(j)) > baseIndent) {
+                final Matcher kv = YAML_KEY_VALUE.matcher(lines.get(j));
+                if (kv.find()) {
+                    fields.put(kv.group(1).trim(), stripQuotes(kv.group(2)));
                 }
+                j++;
+            }
+            return fields;
+        }
 
-                adjustedLines.add(line);
+        private static int skipBlock(List<String> lines, int baseIndent, int currentIdx) {
+            int j = currentIdx + 1;
+            while (j < lines.size() && indentOf(lines.get(j)) > baseIndent) j++;
+            return j - 1;
+        }
+
+        private static int findBlockEnd(List<String> lines, int baseIndent, int startIdx) {
+            int j = startIdx + 1;
+            while (j < lines.size() && indentOf(lines.get(j)) > baseIndent) j++;
+            return j - 1;
+        }
+
+        private static List<String> renderCreateUniqueIndexBlock(int baseIndent, Map<String, String> uniqueFields) {
+            final String pad = " ".repeat(baseIndent);
+            final String table = uniqueFields.getOrDefault("tableName", "");
+            final String csvCols = uniqueFields.getOrDefault("columnNames", "");
+            final String indexName = uniqueFields.getOrDefault("constraintName",
+                    buildUniqueIndexName(table, csvCols));
+
+            final List<String> cols = new ArrayList<>();
+            for (String p : csvCols.split(",")) {
+                final String c = p.trim();
+                if (!c.isEmpty()) cols.add(c);
             }
 
-            if (insideAddUnique) {
-                adjustedLines.addAll(renderCreateUniqueIndexBlock(blockIndent, addUniqueBlock));
+            final List<String> out = new ArrayList<>();
+            out.add(pad + "- createIndex:");
+            out.add(pad + "    tableName: '" + table + "'");
+            out.add(pad + "    indexName: '" + indexName + "'");
+            out.add(pad + "    unique: true");
+            out.add(pad + "    columns:");
+            for (String c : cols) {
+                out.add(pad + "      - column:");
+                out.add(pad + "          name: '" + c + "'");
             }
-            if (insideModifyType) {
-                final PendingTypeChange pending = toPendingTypeChange(modifyTypeBlock);
-                if (pending != null) pendingTypeChanges.add(pending);
+            return out;
+        }
+
+        private static String buildUniqueIndexName(String table, String csvCols) {
+            final String base = (table + "_" + csvCols.replace(",", "_") + "_uq")
+                    .replaceAll("[^A-Za-z0-9_]", "_");
+            return base.length() > 60 ? base.substring(0, 60) : base;
+        }
+
+        private static Optional<PendingTypeChange> toPendingTypeChange(Map<String, String> block) {
+            final String table = block.get("tableName");
+            final String column = block.get("columnName");
+            final String newType = block.get("newDataType");
+            if (isBlank(table) || isBlank(column) || isBlank(newType)) return Optional.empty();
+            return Optional.of(new PendingTypeChange(table, column, newType));
+        }
+
+        private static boolean isBlank(String s) {
+            return s == null || s.trim().isEmpty();
+        }
+
+        // ===== Result types =====
+        private record ChangeSetAnalysis(List<String> rewrittenBlocks,
+                                         boolean injectPreconditions,
+                                         String tableForPrecondition) {
+            boolean shouldInjectPreconditions() { return injectPreconditions; }
+        }
+
+        static final class AdjustResult {
+            final boolean modified;
+            final List<String> adjustedLines;
+            final List<PendingTypeChange> pendingTypeChanges;
+            final List<RemovedForeignKeyBlock> removedForeignKeyBlocks;
+
+            AdjustResult(boolean modified,
+                         List<String> adjustedLines,
+                         List<PendingTypeChange> pendingTypeChanges,
+                         List<RemovedForeignKeyBlock> removedForeignKeyBlocks) {
+                this.modified = modified;
+                this.adjustedLines = List.copyOf(adjustedLines);
+                this.pendingTypeChanges = List.copyOf(pendingTypeChanges);
+                this.removedForeignKeyBlocks = List.copyOf(removedForeignKeyBlocks);
             }
         }
 
-        final boolean modified = !pendingTypeChanges.isEmpty() || fileContains(sourceYaml, ADD_UNIQUE_CONSTRAINT_START);
-
-        if (modified) {
-            if (targetYaml.getParent() != null && !Files.exists(targetYaml.getParent())) {
-                Files.createDirectories(targetYaml.getParent());
-            }
-            try (BufferedWriter writer = Files.newBufferedWriter(targetYaml, StandardCharsets.UTF_8)) {
-                for (String l : adjustedLines) {
-                    writer.write(l);
-                    writer.newLine();
-                }
+        static final class PendingTypeChange {
+            final String tableName;
+            final String columnName;
+            final String newDataType;
+            PendingTypeChange(String tableName, String columnName, String newDataType) {
+                this.tableName = tableName;
+                this.columnName = columnName;
+                this.newDataType = newDataType;
             }
         }
 
-        return new SqliteAdjustmentResult(modified, pendingTypeChanges);
-    }
+        static final class RemovedForeignKeyBlock {
+            final String operation; // addForeignKeyConstraint | dropForeignKeyConstraint
+            final String tableName;
+            final String referencedTableName;
+            final String constraintName;
 
-    private static boolean fileContains(final Path file, final Pattern pattern) throws IOException {
-        try (BufferedReader reader = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                if (pattern.matcher(line).find()) return true;
+            private RemovedForeignKeyBlock(String operation, String tableName, String referencedTableName, String constraintName) {
+                this.operation = operation;
+                this.tableName = tableName;
+                this.referencedTableName = referencedTableName;
+                this.constraintName = constraintName;
             }
-        }
-        return false;
-    }
-
-    private static int leadingSpaces(final String line) {
-        int i = 0;
-        while (i < line.length() && line.charAt(i) == ' ') i++;
-        return i;
-    }
-
-    private static String stripYamlScalar(final String raw) {
-        if (raw == null) return "";
-        final String value = raw.trim();
-        if ((value.startsWith("'") && value.endsWith("'")) || (value.startsWith("\"") && value.endsWith("\""))) {
-            return value.substring(1, value.length() - 1);
-        }
-        return value;
-    }
-
-    private static List<String> renderCreateUniqueIndexBlock(final int indent, final Map<String, String> uniqueBlock) {
-        final String tableName = uniqueBlock.getOrDefault("tableName", "");
-        final String columnNamesCsv = uniqueBlock.getOrDefault("columnNames", "");
-        final String indexName = uniqueBlock.getOrDefault("constraintName",
-                generateUniqueIndexName(tableName, columnNamesCsv));
-
-        final List<String> columns = splitCsv(columnNamesCsv);
-        final String pad = " ".repeat(indent);
-
-        final List<String> lines = new ArrayList<>();
-        lines.add(pad + "- createIndex:");
-        lines.add(pad + "    tableName: " + quoteYaml(tableName));
-        lines.add(pad + "    indexName: " + quoteYaml(indexName));
-        lines.add(pad + "    unique: true");
-        lines.add(pad + "    columns:");
-        for (String col : columns) {
-            lines.add(pad + "      - column:");
-            lines.add(pad + "          name: " + quoteYaml(col));
-        }
-        return lines;
-    }
-
-    private static String generateUniqueIndexName(final String tableName, final String columnNamesCsv) {
-        final String base = (tableName + "_" + columnNamesCsv.replace(",", "_") + "_uq")
-                .replaceAll("[^A-Za-z0-9_]", "_");
-        return base.length() > 60 ? base.substring(0, 60) : base;
-    }
-
-    private static List<String> splitCsv(final String csv) {
-        if (csv == null || csv.isBlank()) return List.of();
-        final String[] parts = csv.split(",");
-        final List<String> out = new ArrayList<>(parts.length);
-        for (String p : parts) {
-            final String v = p.trim();
-            if (!v.isEmpty()) out.add(v);
-        }
-        return out;
-    }
-
-    private static String quoteYaml(final String value) {
-        if (value == null) return "''";
-        return "'" + value.replace("'", "''") + "'";
-    }
-
-    private static PendingTypeChange toPendingTypeChange(final Map<String, String> block) {
-        final String table = block.get("tableName");
-        final String column = block.get("columnName");
-        final String newType = block.get("newDataType");
-        if (isBlank(table) || isBlank(column) || isBlank(newType)) return null;
-        return new PendingTypeChange(table, column, newType);
-    }
-
-    private static boolean isBlank(final String s) {
-        return s == null || s.trim().isEmpty();
-    }
-
-    private static Path buildSqliteAdjustedPath(final Path originalPath) {
-        final String name = originalPath.getFileName().toString();
-        final String adjusted = name.endsWith(".yaml")
-                ? name.substring(0, name.length() - 5) + SQLITE_SUFFIX
-                : name + SQLITE_SUFFIX;
-        return originalPath.getParent() == null
-                ? Path.of(adjusted)
-                : originalPath.getParent().resolve(adjusted);
-    }
-
-    private void logPendingTypeChanges(final List<PendingTypeChange> pendingTypeChanges) {
-        if (pendingTypeChanges.isEmpty()) return;
-        LOGGER.warn("modifyDataType detectado e removido (SQLite não suporta). Pendências:");
-        for (PendingTypeChange p : pendingTypeChanges) {
-            LOGGER.warn(" - table='{}', column='{}', newType='{}'", p.tableName, p.columnName, p.newDataType);
-        }
-        LOGGER.warn("Sugestão: trate mudanças de tipo via rebuild de tabela (ex.: SqliteTableRebuilder).");
-    }
-
-    // ========================================================================
-    // Tipos auxiliares (imutáveis)
-    // ========================================================================
-
-    private static final class SqliteAdjustmentResult {
-        final boolean modified;
-        final List<PendingTypeChange> pendingTypeChanges;
-
-        SqliteAdjustmentResult(final boolean modified, final List<PendingTypeChange> pendingTypeChanges) {
-            this.modified = modified;
-            this.pendingTypeChanges = List.copyOf(pendingTypeChanges);
-        }
-    }
-
-    private static final class PendingTypeChange {
-        final String tableName;
-        final String columnName;
-        final String newDataType;
-
-        PendingTypeChange(final String tableName, final String columnName, final String newDataType) {
-            this.tableName = tableName;
-            this.columnName = columnName;
-            this.newDataType = newDataType;
+            static RemovedForeignKeyBlock add(Map<String, String> fields) {
+                return new RemovedForeignKeyBlock(
+                        "addForeignKeyConstraint",
+                        fields.get("baseTableName"),
+                        fields.get("referencedTableName"),
+                        fields.get("constraintName"));
+            }
+            static RemovedForeignKeyBlock drop(Map<String, String> fields) {
+                return new RemovedForeignKeyBlock(
+                        "dropForeignKeyConstraint",
+                        fields.get("baseTableName"),
+                        fields.get("referencedTableName"),
+                        fields.get("constraintName"));
+            }
         }
     }
 }

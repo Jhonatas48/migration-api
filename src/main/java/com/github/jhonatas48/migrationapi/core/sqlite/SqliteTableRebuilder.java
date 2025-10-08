@@ -156,6 +156,119 @@ public class SqliteTableRebuilder {
         }
     }
 
+    /**
+     * Recria a tabela aplicando alterações de tipo de coluna (equivalente ao "modifyDataType" no SQLite).
+     * Mantém dados, índices, triggers e FKs.
+     *
+     * Estratégia:
+     *  - Cria tabela temporária com os novos tipos
+     *  - Copia dados com CAST apenas nas colunas alteradas
+     *  - Faz swap (__bak_ / __tmp_) e reabilita FKs + valida integridade
+     */
+    public void rebuildTableApplyingColumnTypeChanges(
+            String requestedTableName,
+            List<ColumnTypeChange> typeChanges) throws SQLException {
+
+        if (typeChanges == null || typeChanges.isEmpty()) {
+            LOGGER.info("Nenhuma alteração de tipo informada para '{}'. Nada a fazer.", requestedTableName);
+            return;
+        }
+
+        try (Connection connection = dataSource.getConnection()) {
+            final boolean previousAutoCommit = connection.getAutoCommit();
+            connection.setAutoCommit(false);
+
+            try {
+                disableForeignKeyEnforcement(connection);
+                safelyExecute(connection, PRAGMA_LEGACY_ALTER_ON);
+
+                // Resolve nomes e estado
+                Set<String> existingTables = readExistingTableNames(connection);
+                String physicalTableName = resolveExistingTableNameOrFail(requestedTableName, existingTables);
+
+                // Limpa resíduos
+                dropTableIfExists(connection, TEMP_TABLE_PREFIX + physicalTableName);
+                dropTableIfExists(connection, BACKUP_TABLE_PREFIX + physicalTableName);
+
+                // Lê schema e objetos vinculados
+                TableSchema currentSchema = readCurrentTableSchema(connection, physicalTableName);
+                if (currentSchema.columns.isEmpty()) {
+                    String options = existingTables.stream().sorted().collect(Collectors.joining(", "));
+                    throw new IllegalStateException(
+                            "Tabela não encontrada ou sem colunas: " + physicalTableName +
+                                    ". Tabelas existentes: [" + options + "]"
+                    );
+                }
+
+                String originalCreateTableSql = readCreateTableSql(connection, physicalTableName);
+                List<RawIndexDef> originalIndexDefinitions = readIndexCreateSql(connection, physicalTableName);
+                List<RawTriggerDef> originalTriggerDefinitions = readTriggerCreateSql(connection, physicalTableName);
+
+                // PK e AUTOINCREMENT
+                List<String> primaryKeyColumns = currentSchema.columns.stream()
+                        .filter(c -> c.partOfPrimaryKey)
+                        .map(c -> c.name)
+                        .toList();
+
+                Set<String> autoIncrementColumns = primaryKeyColumns.size() == 1
+                        ? detectAutoIncrementColumns(originalCreateTableSql, primaryKeyColumns)
+                        : Collections.emptySet();
+
+                // FKs atuais permanecem iguais (apenas reconstruiremos a tabela)
+                List<ForeignKeySpec> currentForeignKeys = readCurrentForeignKeys(connection, physicalTableName);
+
+                // Normaliza alvo das colunas a alterar contra o schema físico
+                Map<String, String> newTypesByPhysicalColumn = resolveTypeChangesAgainstPhysicalSchema(
+                        connection, physicalTableName, currentSchema, typeChanges
+                );
+
+                // Gera schema ajustado
+                TableSchema updatedSchema = applyColumnTypeChanges(currentSchema, newTypesByPhysicalColumn);
+
+                // Normaliza FKs (tabelas/colunas) com base no schema atualizado
+                List<ForeignKeySpec> desiredForeignKeys = normalizeForeignKeyColumnsOrFail(
+                        connection, physicalTableName, updatedSchema, currentForeignKeys
+                );
+
+                // Cria tabela temporária com novos tipos
+                String tempTableName   = TEMP_TABLE_PREFIX + physicalTableName;
+                String backupTableName = BACKUP_TABLE_PREFIX + physicalTableName;
+
+                String createTempTableSql = buildCreateTableStatement(
+                        physicalTableName, updatedSchema, desiredForeignKeys, tempTableName, autoIncrementColumns
+                );
+                createTemporaryTable(connection, createTempTableSql);
+
+                // Copia dados com CAST apenas nas colunas alteradas
+                copyDataWithOptionalCasts(connection, physicalTableName, tempTableName, updatedSchema, newTypesByPhysicalColumn);
+
+                // Swap + cleanup
+                renameTableSafely(connection, physicalTableName, backupTableName);
+                renameTableSafely(connection, tempTableName, physicalTableName);
+                dropTableSafely(connection, backupTableName);
+
+                // Recria índices/triggers
+                recreateIndexesFromSqlMaster(connection, physicalTableName, originalIndexDefinitions);
+                recreateTriggersFromSqlMaster(connection, physicalTableName, originalTriggerDefinitions);
+
+                // Valida integridade
+                enableForeignKeyEnforcement(connection);
+                validateReferentialIntegrityOrFail(connection, physicalTableName);
+
+                connection.commit();
+                LOGGER.info("Rebuild com modifyDataType aplicado com sucesso para a tabela '{}'.", physicalTableName);
+
+            } catch (Throwable error) {
+                safeRollback(connection);
+                safelyExecute(connection, PRAGMA_FOREIGN_KEYS_ON);
+                throw error;
+            } finally {
+                safelyExecute(connection, PRAGMA_FOREIGN_KEYS_ON);
+                connection.setAutoCommit(previousAutoCommit);
+            }
+        }
+    }
+
     // =====================================================================================
     // Regras de negócio auxiliares (FKs, normalização, integridade)
     // =====================================================================================
@@ -716,6 +829,42 @@ public class SqliteTableRebuilder {
         executeStatement(connection, insertSql);
     }
 
+    /**
+     * Copia dados com CAST apenas para as colunas cujo tipo foi alterado.
+     */
+    private void copyDataWithOptionalCasts(Connection connection,
+                                           String sourceTable,
+                                           String targetTempTable,
+                                           TableSchema updatedSchema,
+                                           Map<String, String> newTypesByPhysicalColumn) throws SQLException {
+
+        if (newTypesByPhysicalColumn == null || newTypesByPhysicalColumn.isEmpty()) {
+            copyDataSameColumns(connection, sourceTable, targetTempTable, updatedSchema);
+            return;
+        }
+
+        List<String> targetColumns = updatedSchema.columns.stream()
+                .map(c -> quoteIdentifier(c.name))
+                .toList();
+
+        String selectList = updatedSchema.columns.stream()
+                .map(c -> buildSelectExprWithCastIfNeeded(c.name, newTypesByPhysicalColumn))
+                .collect(Collectors.joining(", "));
+
+        String insertSql = "INSERT INTO " + quoteIdentifier(targetTempTable)
+                + "(" + String.join(", ", targetColumns) + ") "
+                + "SELECT " + selectList + " FROM " + quoteIdentifier(sourceTable);
+
+        executeStatement(connection, insertSql);
+    }
+
+    private String buildSelectExprWithCastIfNeeded(String columnName, Map<String, String> newTypesByPhysicalColumn) {
+        String quoted = quoteIdentifier(columnName);
+        String newType = newTypesByPhysicalColumn.get(columnName);
+        if (!hasText(newType)) return quoted;
+        return "CAST(" + quoted + " AS " + newType + ") AS " + quoted;
+    }
+
     private void recreateIndexesFromSqlMaster(Connection connection, String tableName, List<RawIndexDef> indexDefs) throws SQLException {
         for (RawIndexDef def : indexDefs) {
             if (def.createSql == null || def.createSql.isBlank()) continue; // índices implícitos (PK)
@@ -828,7 +977,13 @@ public class SqliteTableRebuilder {
         private final String onDeleteAction;
         private final String onUpdateAction;
         private final String matchAction;
-
+        public ForeignKeySpec(String baseColumnsCsv,
+                              String referencedTable,
+                              String referencedColumnsCsv,
+                              String onDeleteAction,
+                              String onUpdateAction) {
+            this(baseColumnsCsv, referencedTable, referencedColumnsCsv, onDeleteAction, onUpdateAction, null);
+        }
         public ForeignKeySpec(String baseColumnsCsv,
                               String referencedTable,
                               String referencedColumnsCsv,
@@ -874,8 +1029,24 @@ public class SqliteTableRebuilder {
         }
     }
 
+    /** Alteração de tipo de coluna (modifyDataType). */
+    public static final class ColumnTypeChange {
+        private final String columnName;
+        private final String newTypeDeclaration;
+
+        public ColumnTypeChange(String columnName, String newTypeDeclaration) {
+            this.columnName = Objects.requireNonNull(columnName, "columnName é obrigatório");
+            this.newTypeDeclaration = Objects.requireNonNull(newTypeDeclaration, "newTypeDeclaration é obrigatório");
+        }
+
+        public String getColumnName() { return columnName; }
+        public String getNewTypeDeclaration() { return newTypeDeclaration; }
+    }
+
     private static final class TableSchema {
         private final List<TableColumn> columns = new ArrayList<>();
+        private TableSchema() {}
+        private TableSchema(List<TableColumn> cols) { this.columns.addAll(cols); }
     }
 
     private static final class TableColumn {
@@ -963,5 +1134,73 @@ public class SqliteTableRebuilder {
             sb.append(Character.toLowerCase(ch));
         }
         return sb.toString();
+    }
+
+    // =====================================================================================
+    // Suporte interno a modifyDataType (helpers)
+    // =====================================================================================
+
+    private Map<String, String> resolveTypeChangesAgainstPhysicalSchema(Connection connection,
+                                                                        String physicalTableName,
+                                                                        TableSchema currentSchema,
+                                                                        List<ColumnTypeChange> typeChanges) throws SQLException {
+
+        Set<String> physicalColumns = currentSchema.columns.stream()
+                .map(c -> c.name)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+
+        Map<String, String> resolved = new LinkedHashMap<>();
+        for (ColumnTypeChange change : typeChanges) {
+            String target = resolvePhysicalColumnOrFail(change.getColumnName(), physicalColumns,
+                    () -> "modifyDataType (" + physicalTableName + ")");
+            resolved.put(target, change.getNewTypeDeclaration());
+        }
+        return resolved;
+    }
+
+    private TableSchema applyColumnTypeChanges(TableSchema currentSchema, Map<String, String> newTypesByPhysicalColumn) {
+        if (newTypesByPhysicalColumn == null || newTypesByPhysicalColumn.isEmpty()) return currentSchema;
+
+        List<TableColumn> updated = currentSchema.columns.stream()
+                .map(c -> {
+                    String newType = newTypesByPhysicalColumn.get(c.name);
+                    if (!hasText(newType)) return c;
+                    return new TableColumn(c.name, newType, c.notNull, c.defaultExpression, c.partOfPrimaryKey);
+                })
+                .toList();
+
+        return new TableSchema(updated);
+    }
+
+    /** Resolve um único nome de coluna contra o conjunto físico (exato, case-insensitive, canônico, camel->snake). */
+    private static String resolvePhysicalColumnOrFail(String candidate,
+                                                      Set<String> physicalColumns,
+                                                      Supplier<String> contextSupplier) {
+
+        if (!hasText(candidate)) {
+            throw new IllegalArgumentException("Nome de coluna não pode ser nulo/vazio.");
+        }
+
+        if (physicalColumns.contains(candidate)) return candidate;
+
+        Map<String, String> byLower = physicalColumns.stream()
+                .collect(Collectors.toMap(s -> s.toLowerCase(Locale.ROOT), s -> s, (a, b) -> a, LinkedHashMap::new));
+
+        String lower = byLower.get(candidate.toLowerCase(Locale.ROOT));
+        if (lower != null) return lower;
+
+        Map<String, String> byCanonical = new LinkedHashMap<>();
+        for (String c : physicalColumns) byCanonical.put(canonical(c), c);
+
+        String canonical = byCanonical.get(canonical(candidate));
+        if (canonical != null) return canonical;
+
+        String snakeGuess = camelToUnderscore(candidate);
+        String snake = byLower.get(snakeGuess.toLowerCase(Locale.ROOT));
+        if (snake != null) return snake;
+
+        String ctx = contextSupplier.get();
+        String hint = String.join(", ", physicalColumns);
+        throw new IllegalStateException("Coluna não encontrada " + ctx + ": '" + candidate + "'. Existentes: [" + hint + "]");
     }
 }
